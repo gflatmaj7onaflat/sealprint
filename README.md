@@ -38,8 +38,17 @@ and adds **Seal Print** to your app launcher. `./run.sh` also starts it.
 ### Windows
 
 Download `SealPrint-windows.zip` from the [Releases](../../releases) page, unzip it and run
-`SealPrint.exe`. The exe isn't signed, so the first time Windows shows "Windows protected your PC":
-click **More info**, then **Run anyway**.
+`SealPrint.exe` (keep it next to its `_internal` folder). The exe isn't signed, so the first time
+Windows shows "Windows protected your PC": click **More info**, then **Run anyway**.
+
+### Mac
+
+For Macs with Apple Silicon (M1 or later). Download `SealPrint-mac.dmg` from the
+[Releases](../../releases) page, open it and drag **Seal Print** into Applications.
+
+The app isn't notarized by Apple, so macOS blocks it the first time. Open it once and close the
+warning, then go to **System Settings → Privacy & Security**, scroll down to Security and click
+**Open Anyway** next to Seal Print. After that it opens normally.
 
 ## Using it
 
@@ -70,6 +79,7 @@ and `thumb.png`:
 
 - Linux: `~/.local/share/sealprint/library`
 - Windows: `%LOCALAPPDATA%\sealprint\library`
+- Mac: `~/Library/Application Support/sealprint/library`
 
 Copy that folder to back up your seals or move them to another computer.
 
@@ -94,9 +104,9 @@ include fcitx's Qt plugin.
 QT_QPA_PLATFORM=offscreen python -m pytest -q
 ```
 
-Every push runs the tests and builds the Windows version on GitHub Actions; the zip is attached to the
-run under **Artifacts**. Pushing a version tag (`git tag v1.0.0 && git push origin v1.0.0`) also
-publishes it on the Releases page.
+Every push runs the tests and builds the Windows and Mac versions on GitHub Actions; both are
+attached to the run under **Artifacts**. Pushing a version tag (`git tag v1.0.0 && git push origin
+v1.0.0`) also publishes them on the Releases page.
 
 ## License
 

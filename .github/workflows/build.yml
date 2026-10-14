@@ -25,8 +25,6 @@ jobs:
   windows:
     needs: test
     runs-on: windows-latest
-    permissions:
-      contents: write            # lets a version tag attach the zip to its release
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
@@ -41,15 +39,56 @@ jobs:
           $p = Start-Process -FilePath dist\SealPrint\SealPrint.exe -Wait -PassThru `
                -ArgumentList 'examples\red-square.png', '-o', 'smoke.pdf', '--size', '20', '--copies', '4'
           if ($p.ExitCode -ne 0 -or -not (Test-Path smoke.pdf)) { Write-Error "SealPrint.exe could not make a PDF"; exit 1 }
-      - name: Zip
-        shell: pwsh
-        run: Compress-Archive -Path dist\SealPrint -DestinationPath SealPrint-windows.zip
       - uses: actions/upload-artifact@v7
         with:
           name: SealPrint-windows
-          path: SealPrint-windows.zip
-      - name: Attach to the release
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v3
+          path: dist/SealPrint
+
+  mac:
+    needs: test
+    runs-on: macos-latest            # Apple Silicon (M1 and later)
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
         with:
-          files: SealPrint-windows.zip
+          python-version: "3.12"
+      - run: pip install -r requirements.txt pyinstaller
+      - name: Build Seal Print.app
+        run: >
+          pyinstaller --noconfirm --windowed --name "Seal Print" --icon sealprint.icns
+          --osx-bundle-identifier io.github.gflatmaj7onaflat.sealprint sealprint.py
+      - name: Check the built app can make a PDF
+        run: |
+          "dist/Seal Print.app/Contents/MacOS/Seal Print" examples/red-square.png -o smoke.pdf --size 20 --copies 4
+          test -s smoke.pdf
+      - name: Make the disk image
+        run: |
+          mkdir dmg
+          cp -R "dist/Seal Print.app" dmg/
+          ln -s /Applications dmg/Applications
+          hdiutil create -volname "Seal Print" -srcfolder dmg -ov -format UDZO SealPrint-mac.dmg
+      - uses: actions/upload-artifact@v7
+        with:
+          name: SealPrint-mac
+          path: SealPrint-mac.dmg
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [windows, mac]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write                # to create the release and attach the downloads
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          path: artifacts
+      - name: Package the downloads
+        run: |
+          mv artifacts/SealPrint-windows artifacts/SealPrint
+          (cd artifacts && zip -qr ../SealPrint-windows.zip SealPrint)
+          cp artifacts/SealPrint-mac/SealPrint-mac.dmg .
+      - uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            SealPrint-windows.zip
+            SealPrint-mac.dmg
