@@ -22,7 +22,7 @@ if [ "${1:-}" = "--install" ]; then
 [Desktop Entry]
 Type=Application
 Name=Seal Print
-Comment=Print square seal designs at an exact size on A4
+Comment=Print seal designs at exact sizes on A4
 Exec="$HERE/run.sh" %f
 Icon=$HERE/sealprint.svg
 Terminal=false

@@ -1,0 +1,13 @@
+# local Python environment made by run.sh
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# PyInstaller output
+build/
+dist/
+*.spec
+
+# exported sheets
+*.pdf

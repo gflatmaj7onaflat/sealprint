@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-Seal Print: print square Chinese seal designs at exact sizes on A4.
+Seal Print: print Chinese seal designs at their exact size on A4.
 
 Add one or more seal images: files, screenshots pasted with Ctrl+V, or dropped files.
-For each image the app finds the seal's square frame and turns the seal into pure
-black and white. Every seal has its own size and number of copies, and all of them
-are packed onto A4 pages in a single PDF.
+For each image the app finds the seal's frame (square, or any other shape) and turns
+the seal into pure black and white. Every seal has its own size and number of copies,
+and all of them are packed onto A4 pages in a single PDF.
 
-    python3 sealprint.py [image ...]                          # open the window
-    python3 sealprint.py a.png:20:6 b.png:25:2 -o seals.pdf   # no window; image:size_mm:copies
+    python3 sealprint.py [image ...]                                # open the window
+    python3 sealprint.py a.png:20:6 b.png:30:2:other -o seals.pdf   # no window; image:size_mm:copies[:other]
 """
 from __future__ import annotations
 
@@ -29,6 +29,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import QPointF, QRectF, Qt
 
 APP_NAME = "Seal Print"
+__version__ = "1.0.0"
 A4_W, A4_H = 210.0, 297.0           # page size, mm
 PAGE_MARGIN = 10.0                  # mm kept clear at the paper edge
 EXPORT_DPI = 1200                   # resolution of the seal image inside the PDF
@@ -401,7 +402,9 @@ class SealJob:
 
 # ───────────────────────────────────────────────────────────────── seal library
 
-LIBRARY = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share") / "sealprint" / "library"
+# ~/.local/share/sealprint/library on Linux, %LOCALAPPDATA%\sealprint\library on Windows
+LIBRARY = Path(QtCore.QStandardPaths.writableLocation(
+    QtCore.QStandardPaths.StandardLocation.GenericDataLocation)) / "sealprint" / "library"
 SAVED_FIELDS = ("size", "copies", "smooth", "ink_choice", "invert", "mode", "found", "frame_manual",
                 "auto_t", "weight", "square", "ratio")
 
@@ -2386,6 +2389,7 @@ def main() -> int:
     ap.add_argument("--smooth", type=int, default=2, help="edge smoothing 0-10 (2)")
     ap.add_argument("--invert", action="store_true")
     ap.add_argument("--mirror", action="store_true")
+    ap.add_argument("--version", action="version", version=f"{APP_NAME} {__version__}")
     ap.add_argument("--scale", type=float, default=100.0,
                     help="enlarge everything by this percent, for printers that shrink pages (100)")
     a = ap.parse_args()
@@ -2399,6 +2403,12 @@ def main() -> int:
             return 1
 
     use_wayland_text_input()                    # must happen before the QApplication exists
+    if sys.platform == "win32":                 # own taskbar button and icon on Windows
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("SealPrint")
+        except Exception:
+            pass
     app = QtWidgets.QApplication(sys.argv[:1])
     app.setApplicationName("sealprint")
     app.setApplicationDisplayName(APP_NAME)
