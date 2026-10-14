@@ -16,7 +16,7 @@ sys.path.insert(0, str(ROOT))
 from PySide6 import QtCore  # noqa: E402
 import sealprint as sp  # noqa: E402
 
-EXAMPLES = ROOT / "examples"
+IMAGES = Path(__file__).resolve().parent / "images"     # the tests' own seal images
 PT = 72 / 25.4                     # PDF points per mm
 
 
@@ -42,19 +42,19 @@ def placements(pdf: bytes):
 
 
 def test_finds_a_red_seal_in_a_screenshot():
-    corners, mode, found, _ = sp.detect_frame(sp.load_image(str(EXAMPLES / "red-square.png")))
+    corners, mode, found, _ = sp.detect_frame(sp.load_image(str(IMAGES / "red-square.png")))
     assert found and mode == "red"
     assert box(corners) == (300, 130, 360, 360)
 
 
 def test_finds_a_black_seal_next_to_text():
-    corners, mode, found, _ = sp.detect_frame(sp.load_image(str(EXAMPLES / "black-on-a-page.png")))
+    corners, mode, found, _ = sp.detect_frame(sp.load_image(str(IMAGES / "black-on-a-page.png")))
     assert found and mode == "dark"
     assert box(corners) == (60, 120, 300, 300)
 
 
 def test_other_shapes_keep_their_proportions():
-    job = sp.SealJob(sp.load_image(str(EXAMPLES / "oval.png")), "oval", size=30.0, square=False)
+    job = sp.SealJob(sp.load_image(str(IMAGES / "oval.png")), "oval", size=30.0, square=False)
     job.detect()
     w, h = job.dims()
     assert h == pytest.approx(30.0)
@@ -62,7 +62,7 @@ def test_other_shapes_keep_their_proportions():
 
 
 def test_result_is_pure_black_and_white():
-    job = sp.SealJob(sp.load_image(str(EXAMPLES / "red-square.png")), "red", size=20.0)
+    job = sp.SealJob(sp.load_image(str(IMAGES / "red-square.png")), "red", size=20.0)
     job.detect()
     ink = job.render(mirror=False)
     assert ink.dtype == bool and ink.shape == (sp.export_px(20.0), sp.export_px(20.0))
@@ -87,7 +87,7 @@ def test_packing_never_overlaps_or_leaves_the_page():
 
 @pytest.mark.parametrize("scale", [1.0, 1.0361])
 def test_pdf_draws_every_seal_at_its_exact_size(scale):
-    job = sp.SealJob(sp.load_image(str(EXAMPLES / "red-square.png")), "red", size=25.0, copies=3)
+    job = sp.SealJob(sp.load_image(str(IMAGES / "red-square.png")), "red", size=25.0, copies=3)
     job.detect()
     pdf, pages = sp.make_pdf([job], gap=5.0, mirror=False, title="test", scale=scale)
     assert pdf.startswith(b"%PDF-1.4") and pdf.rstrip().endswith(b"%%EOF")
@@ -99,7 +99,7 @@ def test_pdf_draws_every_seal_at_its_exact_size(scale):
 
 
 def test_command_line_specs():
-    oval = str(EXAMPLES / "oval.png")
+    oval = str(IMAGES / "oval.png")
     assert sp.parse_spec(oval, 20.0, 1) == (oval, 20.0, 1, True)
     assert sp.parse_spec(oval + ":30:2:other", 20.0, 1) == (oval, 30.0, 2, False)
     with pytest.raises(ValueError):

@@ -37,7 +37,7 @@ jobs:
         shell: pwsh
         run: |
           $p = Start-Process -FilePath dist\SealPrint\SealPrint.exe -Wait -PassThru `
-               -ArgumentList 'examples\red-square.png', '-o', 'smoke.pdf', '--size', '20', '--copies', '4'
+               -ArgumentList 'tests\images\red-square.png', '-o', 'smoke.pdf', '--size', '20', '--copies', '4'
           if ($p.ExitCode -ne 0 -or -not (Test-Path smoke.pdf)) { Write-Error "SealPrint.exe could not make a PDF"; exit 1 }
       - uses: actions/upload-artifact@v7
         with:
@@ -59,7 +59,7 @@ jobs:
           --osx-bundle-identifier io.github.gflatmaj7onaflat.sealprint sealprint.py
       - name: Check the built app can make a PDF
         run: |
-          "dist/Seal Print.app/Contents/MacOS/Seal Print" examples/red-square.png -o smoke.pdf --size 20 --copies 4
+          "dist/Seal Print.app/Contents/MacOS/Seal Print" tests/images/red-square.png -o smoke.pdf --size 20 --copies 4
           test -s smoke.pdf
       - name: Make the disk image
         run: |
