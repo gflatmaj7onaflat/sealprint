@@ -20,10 +20,13 @@ physical size on A4, ready to transfer onto a seal stone.
 - **Seal library.** Save a seal with its frame and settings, then load it onto any later sheet.
 - **Build new seals from characters.** Cut single characters out of saved seals and name them, then
   compose a new seal from them: pick a format (square, rectangles, circle, oval or your own size), a
-  frame thickness and red or white text.
-- **Edit characters down to single strokes.** Squash a character horizontally or vertically, lengthen
-  it, thicken or invert it, and reshape single strokes: draw along a stroke (or just part of one) to
-  select it, then drag it to pull it longer or bend it like dough.
+  frame thickness and red or white text. Characters scale with their proportions kept; switch the
+  handles to Squish or Crop to change their proportions or trim their edges.
+- **Edit characters down to single strokes.** Squish a character horizontally or vertically, change its
+  weight, and reshape single strokes: draw along a stroke (or just part of one) to select it, then drag
+  it to stretch or bend it like dough, or lengthen it at its free end.
+- **Nothing is lost.** Every edit (squish, crop, strokes, lengthening, weight) has an Original switch
+  that shows the character without it, and switching it back brings the edit back.
 - **Close-up inspection.** Click the black-and-white seal to zoom into the exact pixels that get printed.
 - **Two-tone themes.** Dark, Ink, Lacquer, Paper, Celadon, Blue and white, or your own two colours.
 
@@ -68,9 +71,10 @@ warning, then go to **System Settings → Privacy & Security**, scroll down to S
 4. **Load…** opens the seal library. Under Saved seals, **Pick characters…** lets you drag a box
    around single characters of the selected seal and name them. **Build from scratch** composes a new
    seal from those characters; it is saved to the library like any other seal, and **Edit build**
-   reopens it later. Double-click a character on the seal to open its editor: squish, lengthen, weight
-   and invert, plus single strokes (draw along a stroke to select it, drag the selection to pull or
-   bend it, right-click to clear it, Ctrl+Z to undo).
+   reopens it later. The Handles switch under the seal sets what a character's handles do: Scale
+   (keeps its proportions), Squish or Crop. Double-click a character to open its editor: squish,
+   strokes (draw along a stroke to select it, drag the selection to stretch or bend it, right-click to
+   clear it, Ctrl+Z to undo), lengthen the selected stroke, and weight.
 5. Click the black-and-white seal to inspect it up close (scroll or + and − to zoom, click to go back).
 6. **Export PDF…**
 

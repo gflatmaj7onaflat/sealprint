@@ -2,6 +2,7 @@
 
     QT_QPA_PLATFORM=offscreen python -m pytest -q
 """
+import json
 import random
 import re
 import sys
@@ -116,13 +117,15 @@ def glyph_cross(size=100, bar=12):
     return g
 
 
-def test_lengthening_strokes_keeps_their_thickness():
-    p = sp.Placed("g", "十", glyph_cross(), stretch_v=0.5, stretch_v_at=0.2)
-    g, bands = sp.shape_glyph(p)
-    assert g.shape == (150, 100)                         # 50% taller
-    assert g[:, 50].all()                                # the vertical stroke runs the whole new height
-    assert g[:, 10].sum() == 12                          # the horizontal stroke is still 12 px thick
-    assert bands[0] < bands[1]
+def test_lengthening_a_selected_stroke_grows_its_free_end():
+    g = np.pad(glyph_cross(200, 20), 80)                 # bar rows 170-189, x 80-279
+    sel, centre = sp.select_stroke(g, np.column_stack([np.linspace(205, 276, 40), np.full(40, 180.0)]))
+    end = sp.free_end(g, sel, centre)
+    assert end == 1                                      # the right end is free, the left joins the cross
+    out, _, _ = sp.lengthen_stroke(g, sel, centre, 0.5, end)
+    assert abs(np.nonzero(out[180])[0].max() - 313) <= 2   # 50% of the ~68 px selected
+    assert [int(out[:, x].sum()) for x in (240, 290, 310)] == [20, 20, 20]   # no thicker
+    assert (out[:, :195] == g[:, :195]).all()            # the rest is untouched
 
 
 def test_build_frame_shape_and_white_text():
@@ -148,11 +151,12 @@ def test_auto_arrange_reads_right_to_left():
     b = sp.Build("rect", 20, 20, frame_mm=1.0)
     b.chars = [sp.Placed(str(i), str(i), glyph_cross()) for i in range(4)]
     sp.auto_arrange(b)
-    first, second, third, fourth = b.chars
-    assert first.cx > third.cx and second.cx > fourth.cx        # first column is on the right
-    assert first.cy < second.cy and third.cy < fourth.cy        # each column top to bottom
-    for p in b.chars:
-        assert 1.0 < p.cx - p.w / 2 and p.cx + p.w / 2 < 19.0   # inside the frame
+    first, second, third, fourth = (sp.char_rect(p) for p in b.chars)
+    assert first[0] > third[0] and second[0] > fourth[0]        # first column is on the right
+    assert first[1] < second[1] and third[1] < fourth[1]        # each column top to bottom
+    for x, y, w, h in (first, second, third, fourth):
+        assert 1.0 < x and x + w < 19.0 and 1.0 < y and y + h < 19.0   # inside the frame
+        assert abs(w - h) < 0.05                                # kept their proportions
 
 
 def test_characters_and_builds_round_trip(tmp_path, monkeypatch):
@@ -164,14 +168,18 @@ def test_characters_and_builds_round_trip(tmp_path, monkeypatch):
     assert entry["name"] == "十" and entry["parent_name"] == "Test seal"
     assert (sp.png_to_ink(entry["dir"] / "glyph.png") == glyph).all()
     b = sp.Build("ellipse", 18, 24, frame_mm=0.8)
-    b.chars = [sp.Placed(cid, "十", glyph, stretch_v=0.2, invert=True)]
+    op = {"kind": "lengthen", "path": [[60.0, 59.0], [95.0, 59.0]], "amount": 0.4, "end": 1}
+    b.chars = [sp.Placed(cid, "十", glyph, sq_x=0.8, use_squish=False, crop=[0, 0, 90, 130], ops=[op], invert=True)]
     sp.auto_arrange(b)
+    before = sp.render_build(b, 10)
     sid = sp.save_build(b, "十字", None)
     [seal] = sp.library_entries()
     assert seal["name"] == "十字" and seal["square"] is False and seal["size"] == 24
     again = sp.load_build(seal)
     assert (again.shape, again.w_mm, again.h_mm, again.frame_mm) == ("ellipse", 18, 24, 0.8)
-    assert again.chars[0].invert and again.chars[0].stretch_v == 0.2
+    c = again.chars[0]
+    assert c.invert and c.sq_x == 0.8 and not c.use_squish and c.crop == [0, 0, 90, 130] and c.ops == [op]
+    assert (sp.render_build(again, 10) == before).all()
     job = sp.job_from_library(seal)
     assert job.lib_id == sid and job.dims() == pytest.approx((18, 24), abs=0.05)
 
@@ -207,13 +215,32 @@ def test_pulling_a_stroke_lengthens_it_without_thickening():
     assert (bent[:, 160:200] == g[:, 160:200]).all()     # the junction and the other stroke stay put
 
 
-def test_resizing_a_characters_canvas_keeps_it_in_place():
-    b = sp.Build("rect", 20, 20, 1.0)
-    p = sp.Placed("g", "十", glyph_cross(), stretch_v=0.3, stretch_v_at=0.3)
-    b.chars = [p]
-    sp.auto_arrange(b)
-    before = sp.render_build(b, 20)
-    sp.resize_canvas(p, 30, 10, 25, 5)
-    assert (before != sp.render_build(b, 20)).sum() <= 4
-    sp.resize_canvas(p, -30, -10, -25, -5)
-    assert (before == sp.render_build(b, 20)).all()
+def test_every_edit_can_be_switched_off_and_on_again():
+    g = glyph_cross(200, 20)                             # bar rows 90-109, x 0-199
+    p = sp.Placed("g", "十", g, cx=10, cy=10, scale=0.05)
+    plain = sp.char_rect(p)
+    p.ops = [{"kind": "lengthen", "path": [[125.0, 99.5], [196.0, 99.5]], "amount": 0.5, "end": 1}]
+    p.sq_x, p.weight, p.crop = 0.7, 2, [20, 0, 200, 200]
+    edited = sp.char_rect(p)
+    assert edited != plain
+    for flag in ("use_strokes", "use_lengthen", "use_squish", "use_weight", "use_crop"):
+        setattr(p, flag, False)
+    assert sp.char_rect(p) == pytest.approx(plain)       # every Original switch on: as picked
+    for flag in ("use_strokes", "use_lengthen", "use_squish", "use_weight", "use_crop"):
+        setattr(p, flag, True)
+    assert sp.char_rect(p) == pytest.approx(edited)      # and back
+
+
+def test_builds_from_earlier_versions_still_open(tmp_path):
+    d = tmp_path / "seal"
+    (d / "glyphs").mkdir(parents=True)
+    (d / "glyphs" / "g1.png").write_bytes(sp.ink_to_png(glyph_cross()))
+    old = {"version": 1, "shape": "rect", "w_mm": 20, "h_mm": 20, "frame_mm": 1, "invert_all": False,
+           "chars": [{"glyph_id": "g1", "name": "十", "cx": 10, "cy": 10, "w": 8, "h": 12, "weight": 1,
+                      "stretch_v": 0.5, "stretch_v_at": 0.2, "stretch_h": 0, "stretch_h_at": 0.5, "invert": False}]}
+    (d / "build.json").write_text(json.dumps(old), "utf-8")
+    b = sp.load_build({"dir": d})
+    p = b.chars[0]
+    assert p.src.shape == (150, 100) and p.weight == 1   # the old lengthening is baked into the picture
+    x, y, w, h = sp.char_rect(p)
+    assert abs(x + w / 2 - 10) < 0.3 and abs(y + h / 2 - 10) < 0.3 and h > w
