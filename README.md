@@ -18,14 +18,16 @@ physical size on A4, ready to transfer onto a seal stone.
 - **Exact size, even on stubborn printers.** For self-service printers that always shrink pages to fit,
   the Enlarge setting compensates, and Calibrate works out the number from a test print.
 - **Seal library.** Save a seal with its frame and settings, then load it onto any later sheet.
-- **Build new seals from characters.** Cut single characters out of saved seals and name them, then
-  compose a new seal from them: pick a format (square, rectangles, circle, oval or your own size), a
-  frame thickness and red or white text. Characters scale with their proportions kept; switch the
-  handles to Squish or Crop to change their proportions or trim their edges.
+- **Build new seals from characters.** Cut single characters out of saved seals (with a box, or by
+  drawing an outline around them by hand) and name them, then compose a new seal from them: pick a
+  format (square, rectangles, circle, oval or your own size), a frame thickness, round corners and red
+  or white text. Characters scale with their proportions kept; switch the handles to Squish or Crop to
+  change their proportions or trim their edges. Characters can overlap: the paper around them is
+  see-through. The canvas zooms, and has faint guides through the middle.
 - **Edit characters down to single strokes.** Squish a character horizontally or vertically, change its
-  weight, and reshape single strokes: draw along a stroke (or just part of one) to select it, then drag
-  it to stretch or bend it like dough, or lengthen it at its free end.
-- **Nothing is lost.** Every edit (squish, crop, strokes, lengthening, weight) has an Original switch
+  weight, erase parts of it, and reshape single strokes: draw along a stroke (or just part of one) to
+  select it, then drag it to stretch or bend it like dough, or lengthen it at its free end.
+- **Nothing is lost.** Every edit (squish, crop, strokes, lengthening, erasing, weight) has an Original switch
   that shows the character without it, and switching it back brings the edit back.
 - **Close-up inspection.** Click the black-and-white seal to zoom into the exact pixels that get printed.
 - **Two-tone themes.** Dark, Ink, Lacquer, Paper, Celadon, Blue and white, or your own two colours.

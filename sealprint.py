@@ -29,7 +29,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import QPointF, QRectF, Qt
 
 APP_NAME = "Seal Print"
-__version__ = "1.3.0"
+__version__ = "1.4.0"
 A4_W, A4_H = 210.0, 297.0           # page size, mm
 PAGE_MARGIN = 10.0                  # mm kept clear at the paper edge
 EXPORT_DPI = 1200                   # resolution of the seal image inside the PDF
@@ -511,17 +511,19 @@ def png_to_ink(path) -> np.ndarray:
     return g < 128
 
 
-def tidy_glyph(ink: np.ndarray, drop_edge_pieces: bool = False) -> np.ndarray | None:
-    """Clean a cropped character: drop specks (and, if asked, bits cut off at the box edge),
-    then trim it to its ink with an even margin. None if nothing is left."""
+def tidy_glyph(ink: np.ndarray, drop_edge_pieces: bool = False, edge: np.ndarray | None = None) -> np.ndarray | None:
+    """Clean a cropped character: drop specks (and, if asked, bits cut off at the edge of the
+    box, or of a hand-drawn outline given as `edge`), then trim it to its ink with an even
+    margin. None if nothing is left."""
     H, W = ink.shape
     n, lab, st, _ = cv2.connectedComponentsWithStats(ink.astype(np.uint8), connectivity=8)
+    cut = set(np.unique(lab[edge & ink]).tolist()) if (drop_edge_pieces and edge is not None) else set()
     keep = np.zeros(n, bool)
     for i in range(1, n):
         x, y, w, h, area = st[i]
         if area < max(4, H * W * 2e-4):
             continue
-        if drop_edge_pieces and (x == 0 or y == 0 or x + w >= W or y + h >= H):
+        if drop_edge_pieces and (i in cut if edge is not None else (x == 0 or y == 0 or x + w >= W or y + h >= H)):
             continue
         keep[i] = True
     ink = keep[lab]
@@ -549,13 +551,17 @@ def character_entries() -> list[dict]:
     return entries
 
 
-def save_character(glyph: np.ndarray, name: str, parent_id: str, parent_name: str, rect) -> str:
+def save_character(glyph: np.ndarray, name: str, parent_id: str, parent_name: str, rect, poly=None) -> str:
+    """Save a picked character. rect is where it was on its seal (fractions of the seal's size);
+    poly the outline drawn around it, if it was drawn by hand."""
     cid = new_id()
     d = CHARACTERS / cid
     d.mkdir(parents=True, exist_ok=True)
     (d / "glyph.png").write_bytes(ink_to_png(glyph))
     meta = {"version": 1, "name": name, "parent_id": parent_id, "parent_name": parent_name,
             "rect": [float(v) for v in rect], "saved": time.strftime("%Y-%m-%d %H:%M:%S")}
+    if poly is not None:
+        meta["poly"] = [[round(float(x), 5), round(float(y), 5)] for x, y in poly]
     (d / "char.json").write_text(json.dumps(meta, ensure_ascii=False, indent=1), "utf-8")
     return cid
 
@@ -581,12 +587,15 @@ class Placed:
     ops: list = field(default_factory=list)   # stroke edits, in order
     use_strokes: bool = True
     use_lengthen: bool = True
+    use_erase: bool = True
     invert: bool = False
+    z: float = 0.0                   # stacking: higher is on top where characters overlap
     cache: tuple | None = None
 
 
 PLACED_FIELDS = ("glyph_id", "name", "cx", "cy", "scale", "sq_x", "sq_y", "use_squish", "crop", "use_crop",
-                 "weight", "use_weight", "ops", "use_strokes", "use_lengthen", "invert")
+                 "weight", "use_weight", "ops", "use_strokes", "use_lengthen", "use_erase", "invert", "z")
+OP_SWITCH = {"drag": "use_strokes", "lengthen": "use_lengthen", "erase": "use_erase"}
 
 
 @dataclass(eq=False)
@@ -597,6 +606,7 @@ class Build:
     frame_mm: float = 1.0            # frame line thickness, 0 for none
     invert_all: bool = False         # white text (bai wen): ink and paper swapped inside the shape
     chars: list = field(default_factory=list)
+    corner_mm: float = 0.0           # rounded corners for rectangles, 0 for square ones
 
 
 EDIT_PAD = 0.35                      # room around a character for strokes to be pulled into
@@ -618,11 +628,25 @@ def thicken(g: np.ndarray, weight: int, ref: float) -> np.ndarray:
 
 
 def active_ops(p: Placed) -> list:
-    return [op for op in p.ops if (p.use_strokes if op["kind"] == "drag" else p.use_lengthen)]
+    return [op for op in p.ops if getattr(p, OP_SWITCH[op["kind"]])]
+
+
+def erase_mask(shape, points, radius: float, offset: float = 0.0) -> np.ndarray:
+    """Where an eraser path (round brush) has been."""
+    m = np.zeros(shape, np.uint8)
+    pts = np.round(np.asarray(points, np.float64).reshape(-1, 2) + offset).astype(np.int32)
+    r = max(1, int(round(radius)))
+    if len(pts) > 1:
+        cv2.polylines(m, [pts.reshape(-1, 1, 2)], False, 1, 2 * r + 1)
+    for x, y in pts[[0, -1]]:
+        cv2.circle(m, (int(x), int(y)), r, 1, -1)
+    return m > 0
 
 
 def apply_op(g: np.ndarray, op: dict, pad: int) -> tuple[np.ndarray, np.ndarray | None, np.ndarray | None]:
     """Replay one stroke edit on a padded canvas: (canvas, the stroke afterwards, its centreline)."""
+    if op["kind"] == "erase":
+        return g & ~erase_mask(g.shape, op["points"], op["radius"], pad), None, None
     found = select_stroke(g, np.asarray(op["path"], np.float64) + pad)
     if found is None:
         return g, None, None
@@ -824,6 +848,19 @@ def fit_glyph(g: np.ndarray, gw: int, gh: int) -> np.ndarray:
     return f >= 0.5
 
 
+def _rounded(W: int, H: int, inset: float, radius: float) -> np.ndarray:
+    """The inside of a rectangle with rounded corners, set in from the image's edges; corners
+    set in further get smaller radii, so a frame between two of them is evenly thick."""
+    yy, xx = np.mgrid[0:H, 0:W] + 0.5
+    x0, y0, x1, y1 = inset, inset, W - inset, H - inset
+    inside = (xx >= x0) & (xx <= x1) & (yy >= y0) & (yy <= y1)
+    r = radius - inset
+    if r > 0:
+        nx, ny = np.clip(xx, x0 + r, x1 - r), np.clip(yy, y0 + r, y1 - r)
+        inside &= (xx - nx) ** 2 + (yy - ny) ** 2 <= r * r
+    return inside
+
+
 def _ellipse(W: int, H: int, a: float, b: float) -> np.ndarray:
     if a <= 0 or b <= 0:
         return np.zeros((H, W), bool)
@@ -982,11 +1019,20 @@ def lengthen_stroke(ink: np.ndarray, sel: np.ndarray, centre: np.ndarray, amount
     return out, nsel, (ncentre[::-1] if end == 0 else ncentre)
 
 
+def shape_inside(b: Build, W: int, H: int, px_per_mm: float) -> np.ndarray:
+    """Which pixels of the build's image are inside its outline."""
+    if b.shape == "ellipse":
+        return _ellipse(W, H, W / 2, H / 2)
+    if b.corner_mm > 0:
+        return _rounded(W, H, 0, b.corner_mm * px_per_mm)
+    return np.ones((H, W), bool)
+
+
 def render_build(b: Build, px_per_mm: float) -> np.ndarray:
     """The built seal as a bool image (True = black)."""
     W, H = max(8, round(b.w_mm * px_per_mm)), max(8, round(b.h_mm * px_per_mm))
     ink = np.zeros((H, W), bool)
-    for p in b.chars:
+    for p in sorted(b.chars, key=lambda q: q.z):     # later ones on top; paper is see-through
         img = process_char(p)[0]
         x, y, w, h = char_rect(p)
         gw, gh = max(1, round(w * px_per_mm)), max(1, round(h * px_per_mm))
@@ -1008,6 +1054,11 @@ def render_build(b: Build, px_per_mm: float) -> np.ndarray:
         inside = _ellipse(W, H, W / 2, H / 2)
         if t > 0:
             ink |= _ellipse(W, H, W / 2 - o, H / 2 - o) & ~_ellipse(W, H, W / 2 - o - t, H / 2 - o - t)
+    elif b.corner_mm > 0:
+        R = b.corner_mm * px_per_mm
+        inside = _rounded(W, H, 0, R)
+        if t > 0:
+            ink |= _rounded(W, H, o, R) & ~_rounded(W, H, o + t, R)
     else:
         inside = np.ones((H, W), bool)
         if t > 0:
@@ -1082,7 +1133,8 @@ def save_build(b: Build, name: str, lib_id: str | None = None) -> str:
     save_to_library(job, name)
     d = LIBRARY / job.lib_id
     layout = {"version": 2, "shape": b.shape, "w_mm": b.w_mm, "h_mm": b.h_mm, "frame_mm": b.frame_mm,
-              "invert_all": b.invert_all, "chars": [{k: getattr(p, k) for k in PLACED_FIELDS} for p in b.chars]}
+              "invert_all": b.invert_all, "corner_mm": b.corner_mm,
+              "chars": [{k: getattr(p, k) for k in PLACED_FIELDS} for p in b.chars]}
     (d / "build.json").write_text(json.dumps(layout, ensure_ascii=False, indent=1), "utf-8")
     gd = d / "glyphs"                                # its own copy of each character's picture
     gd.mkdir(exist_ok=True)
@@ -1112,7 +1164,8 @@ def _from_v1(c: dict, g: np.ndarray) -> Placed:
 def load_build(entry: dict) -> Build:
     d = Path(entry["dir"])
     data = json.loads((d / "build.json").read_text("utf-8"))
-    b = Build(data["shape"], data["w_mm"], data["h_mm"], data["frame_mm"], data["invert_all"])
+    b = Build(data["shape"], data["w_mm"], data["h_mm"], data["frame_mm"], data["invert_all"],
+              corner_mm=float(data.get("corner_mm", 0.0)))
     for c in data["chars"]:
         g = png_to_ink(d / "glyphs" / f"{c['glyph_id']}.png")
         if data.get("version", 1) < 2:
@@ -1710,8 +1763,10 @@ class SealStrip(QtWidgets.QListWidget):
 
 
 class PickView(QtWidgets.QGraphicsView):
-    """A seal in black and white. Drag a box around a character; scroll to zoom."""
+    """A seal in black and white. Drag a box around a character, or in draw mode draw an
+    outline around it by hand; scroll to zoom."""
     boxDrawn = QtCore.Signal(QRectF)          # in image pixels
+    lassoDrawn = QtCore.Signal(object)        # the outline, an N x 2 array of image pixels
     pickClicked = QtCore.Signal(str)          # id of a saved character that was clicked
 
     def __init__(self, img: QtGui.QImage):
@@ -1732,20 +1787,33 @@ class PickView(QtWidgets.QGraphicsView):
         self.box = self.scene().addRect(QRectF(), pen, QtGui.QBrush(QtGui.QColor(216, 69, 47, 45)))
         self.box.setZValue(5)
         self.box.hide()
+        self.lasso = self.scene().addPath(QtGui.QPainterPath(), pen, QtGui.QBrush(QtGui.QColor(216, 69, 47, 45)))
+        self.lasso.setZValue(5)
+        self.lasso.hide()
+        self.mode = "box"
+        self.points: list = []
         self.picks = []
         self.start = None
         self.auto_fit = True
 
     def show_picks(self, picks):
-        """Outline the characters already saved from this seal: (id, name, normalised rect)."""
+        """Outline the characters already saved from this seal: (id, name, normalised rect,
+        normalised hand-drawn outline or None)."""
         for item in self.picks:
             self.scene().removeItem(item)
         self.picks = []
         W, H = self.img_size.width(), self.img_size.height()
-        for cid, name, (x, y, w, h) in picks:
+        for cid, name, (x, y, w, h), poly in picks:
             pen = QtGui.QPen(QtGui.QColor(CINNABAR), 1.5, Qt.PenStyle.DashLine)
             pen.setCosmetic(True)
-            r = self.scene().addRect(QRectF(x * W, y * H, w * W, h * H), pen)
+            if poly:
+                path = QtGui.QPainterPath(QPointF(poly[0][0] * W, poly[0][1] * H))
+                for px, py in poly[1:]:
+                    path.lineTo(px * W, py * H)
+                path.closeSubpath()
+                r = self.scene().addPath(path, pen)
+            else:
+                r = self.scene().addRect(QRectF(x * W, y * H, w * W, h * H), pen)
             r.setData(0, cid)
             r.setZValue(3)
             label = QtWidgets.QGraphicsSimpleTextItem(name)
@@ -1758,6 +1826,16 @@ class PickView(QtWidgets.QGraphicsView):
 
     def clear_box(self):
         self.box.hide()
+        self.lasso.hide()
+
+    def _clicked(self, end: QPointF):
+        """A click rather than a drag: select the saved character under it, if any."""
+        self.box.hide()
+        self.lasso.hide()
+        for item in self.picks:
+            if isinstance(item, QtWidgets.QAbstractGraphicsShapeItem) and item.data(0) and item.contains(end):
+                self.pickClicked.emit(item.data(0))
+                break
 
     def fit(self):
         self.fitInView(self.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
@@ -1781,27 +1859,50 @@ class PickView(QtWidgets.QGraphicsView):
         if e.button() != Qt.MouseButton.LeftButton:
             return super().mousePressEvent(e)
         self.start = self.mapToScene(e.position().toPoint())
-        self.box.setRect(QRectF(self.start, self.start))
-        self.box.show()
+        if self.mode == "draw":
+            self.points = [self.start]
+            self.lasso.setPath(QtGui.QPainterPath(self.start))
+            self.lasso.show()
+            self.box.hide()
+        else:
+            self.box.setRect(QRectF(self.start, self.start))
+            self.box.show()
+            self.lasso.hide()
 
     def mouseMoveEvent(self, e):
         if self.start is None:
             return super().mouseMoveEvent(e)
-        self.box.setRect(QRectF(self.start, self.mapToScene(e.position().toPoint())).normalized())
+        pt = self.mapToScene(e.position().toPoint())
+        if self.mode == "draw":
+            self.points.append(pt)
+            path = self.lasso.path()
+            path.lineTo(pt)
+            self.lasso.setPath(path)
+        else:
+            self.box.setRect(QRectF(self.start, pt).normalized())
 
     def mouseReleaseEvent(self, e):
         if self.start is None or e.button() != Qt.MouseButton.LeftButton:
             return super().mouseReleaseEvent(e)
         end = self.mapToScene(e.position().toPoint())
-        r = QRectF(self.start, end).normalized().intersected(QRectF(QPointF(0, 0), self.img_size))
         self.start = None
-        if r.width() < 4 or r.height() < 4:            # a click: was it on a saved character?
-            self.box.hide()
-            for item in self.picks:
-                if isinstance(item, QtWidgets.QGraphicsRectItem) and item.rect().contains(end):
-                    self.pickClicked.emit(item.data(0))
-                    break
+        if self.mode == "draw":
+            pts = np.array([[p.x(), p.y()] for p in self.points + [end]])
+            self.points = []
+            if len(pts) < 4 or np.ptp(pts[:, 0]) < 4 or np.ptp(pts[:, 1]) < 4:
+                return self._clicked(end)
+            path = QtGui.QPainterPath(QPointF(*pts[0]))
+            for x, y in pts[1:]:
+                path.lineTo(x, y)
+            path.closeSubpath()                         # the outline closes itself
+            self.lasso.setPath(path)
+            pts[:, 0] = np.clip(pts[:, 0], 0, self.img_size.width())
+            pts[:, 1] = np.clip(pts[:, 1], 0, self.img_size.height())
+            self.lassoDrawn.emit(pts)
             return
+        r = QRectF(self.box.rect()).intersected(QRectF(QPointF(0, 0), self.img_size))
+        if r.width() < 4 or r.height() < 4:
+            return self._clicked(end)
         self.box.setRect(r)
         self.boxDrawn.emit(r)
 
@@ -1824,7 +1925,7 @@ class CharacterPicker(QtWidgets.QDialog):
             self.ink = job_from_library(entry).render_long(1600)
         finally:
             QtWidgets.QApplication.restoreOverrideCursor()
-        self.crop = self.rect = None
+        self.region = self.mask = self.edge = self.rect = self.poly = None
         h = QtWidgets.QHBoxLayout(self)
         h.setSpacing(12)
         self.view = PickView(ink_to_qimage(self.ink))
@@ -1834,6 +1935,23 @@ class CharacterPicker(QtWidgets.QDialog):
         h.addLayout(side)
         fm = self.fontMetrics()
         width = max(240, fm.horizontalAdvance("M") * 19)
+        modes = QtWidgets.QHBoxLayout()
+        modes.setSpacing(4)
+        modes.addWidget(QtWidgets.QLabel("Select with"))
+        self.mode_buttons = {}
+        for key, label, tip in (("box", "Box", "Drag a box around the character"),
+                                ("draw", "Draw", "Draw an outline around the character by hand, "
+                                                 "for characters that interlock with their neighbours")):
+            b = QtWidgets.QPushButton(label)
+            b.setCheckable(True)
+            b.setAutoExclusive(True)
+            b.setToolTip(tip)
+            b.clicked.connect(lambda _=False, k=key: self.set_mode(k))
+            modes.addWidget(b)
+            self.mode_buttons[key] = b
+        self.mode_buttons["box"].setChecked(True)
+        modes.addStretch(1)
+        side.addLayout(modes)
         self.hint = muted_label("Drag a box around one character. Scroll to zoom.")
         self.hint.setFixedWidth(width)
         side.addWidget(self.hint)
@@ -1849,8 +1967,9 @@ class CharacterPicker(QtWidgets.QDialog):
         side.addWidget(self.name)
         self.chk_flip = QtWidgets.QCheckBox("White strokes: flip them to black")
         self.chk_flip.setToolTip("For white-text seals, so the strokes become the ink of the character")
-        self.chk_edge = QtWidgets.QCheckBox("Drop bits cut off at the box edge")
-        self.chk_edge.setToolTip("Removes pieces of the frame or of neighbouring characters that the box clipped")
+        self.chk_edge = QtWidgets.QCheckBox("Drop bits cut off at the edge")
+        self.chk_edge.setToolTip("Removes pieces of the frame or of neighbouring characters that the box "
+                                 "or outline clipped")
         for c in (self.chk_flip, self.chk_edge):
             c.toggled.connect(self._show_preview)
             side.addWidget(c)
@@ -1879,33 +1998,61 @@ class CharacterPicker(QtWidgets.QDialog):
         row.addWidget(done)
         side.addLayout(row)
         self.view.boxDrawn.connect(self.on_box)
+        self.view.lassoDrawn.connect(self.on_lasso)
         self.view.pickClicked.connect(self.select_pick)
         fit_to_screen(self, 980, 660)
         self.refresh()
         self._show_preview()
 
-    def on_box(self, r: QRectF):
+    def set_mode(self, mode: str):
+        self.view.mode = mode
+        self.mode_buttons[mode].setChecked(True)
+        self.hint.setText("Drag a box around one character. Scroll to zoom." if mode == "box" else
+                          "Draw an outline around one character; it closes by itself. Scroll to zoom.")
+
+    def _picked(self, x0, y0, x1, y1, mask, edge, poly):
         H, W = self.ink.shape
-        x0, y0 = max(0, int(r.left())), max(0, int(r.top()))
-        x1, y1 = min(W, int(math.ceil(r.right()))), min(H, int(math.ceil(r.bottom())))
-        self.crop = self.ink[y0:y1, x0:x1]
+        self.region, self.mask, self.edge, self.poly = self.ink[y0:y1, x0:x1], mask, edge, poly
         self.rect = (x0 / W, y0 / H, (x1 - x0) / W, (y1 - y0) / H)
+        inside = self.region[mask] if mask is not None else self.region
         self.chk_flip.blockSignals(True)
-        self.chk_flip.setChecked(bool(self.crop.mean() > 0.55))     # mostly black: white strokes
+        self.chk_flip.setChecked(bool(inside.size and inside.mean() > 0.55))   # mostly black: white strokes
         self.chk_flip.blockSignals(False)
         self._show_preview()
         self.name.setFocus()
 
+    def on_box(self, r: QRectF):
+        H, W = self.ink.shape
+        x0, y0 = max(0, int(r.left())), max(0, int(r.top()))
+        x1, y1 = min(W, int(math.ceil(r.right()))), min(H, int(math.ceil(r.bottom())))
+        self._picked(x0, y0, x1, y1, None, None, None)
+
+    def on_lasso(self, pts: np.ndarray):
+        H, W = self.ink.shape
+        x0, y0 = max(0, int(pts[:, 0].min())), max(0, int(pts[:, 1].min()))
+        x1, y1 = min(W, int(math.ceil(pts[:, 0].max())) + 1), min(H, int(math.ceil(pts[:, 1].max())) + 1)
+        if x1 - x0 < 4 or y1 - y0 < 4:
+            return
+        local = np.round(pts - (x0, y0)).astype(np.int32).reshape(-1, 1, 2)
+        mask = np.zeros((y1 - y0, x1 - x0), np.uint8)
+        cv2.fillPoly(mask, [local], 1)
+        edge = np.zeros_like(mask)
+        cv2.polylines(edge, [local], True, 1, 3)
+        self._picked(x0, y0, x1, y1, mask > 0, edge > 0, pts / (W, H))
+
     def glyph(self):
-        if self.crop is None:
+        if self.region is None:
             return None
-        return tidy_glyph(~self.crop if self.chk_flip.isChecked() else self.crop, self.chk_edge.isChecked())
+        g = ~self.region if self.chk_flip.isChecked() else self.region
+        if self.mask is not None:
+            g = g & self.mask                          # only what is inside the outline
+        return tidy_glyph(g, self.chk_edge.isChecked(), self.edge)
 
     def _show_preview(self, *_):
         g = self.glyph()
         if g is None:
             self.preview.setPixmap(QtGui.QPixmap())
-            self.preview.setText("" if self.crop is None else "Nothing left in that box")
+            self.preview.setText("" if self.region is None else "Nothing left in there")
         else:
             img = ink_to_qimage(g).scaled(self.preview.size() * self.devicePixelRatioF(),
                                           Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
@@ -1925,8 +2072,8 @@ class CharacterPicker(QtWidgets.QDialog):
         if not name:
             self.name.setFocus()
             return
-        save_character(g, name, self.parent_id, self.parent_name, self.rect)
-        self.crop = self.rect = None
+        save_character(g, name, self.parent_id, self.parent_name, self.rect, self.poly)
+        self.region = self.mask = self.edge = self.rect = self.poly = None
         self.view.clear_box()
         self.name.clear()
         self.hint.setText(f"Saved “{name}”. Drag a box around the next one.")
@@ -1940,7 +2087,8 @@ class CharacterPicker(QtWidgets.QDialog):
             item = QtWidgets.QListWidgetItem(glyph_icon(e["dir"] / "glyph.png", 80), e.get("name", ""))
             item.setData(Qt.ItemDataRole.UserRole, str(e["dir"]))
             self.list.addItem(item)
-        self.view.show_picks([(e["dir"].name, e.get("name", ""), e.get("rect", (0, 0, 0, 0))) for e in mine])
+        self.view.show_picks([(e["dir"].name, e.get("name", ""), e.get("rect", (0, 0, 0, 0)), e.get("poly"))
+                              for e in mine])
         self._buttons()
 
     def select_pick(self, cid: str):
@@ -2005,6 +2153,7 @@ class CharBox(QtWidgets.QGraphicsRectItem):
         self.setCursor(Qt.CursorShape.SizeAllCursor)
         self.setZValue(2)
         self.handles = [ResizeHandle(self, i) for i in range(8)]
+        self.base_z = 2.0
         self._silent = False
         self._pos = QPointF()
         self.sync()
@@ -2030,7 +2179,7 @@ class CharBox(QtWidgets.QGraphicsRectItem):
                          Qt.PenStyle.DashLine if sel else Qt.PenStyle.DotLine)
         pen.setCosmetic(True)
         self.setPen(pen)
-        self.setZValue(3 if sel else 2)
+        self.setZValue(self.base_z + (1 if sel else 0))
 
     def begin_handle(self) -> dict:
         p = self.p
@@ -2092,6 +2241,51 @@ class CharBox(QtWidgets.QGraphicsRectItem):
         self.sync()
         self.composer.box_changed(self)
 
+    def ink_near(self, pos: QPointF) -> bool:
+        """Whether this character has ink under a point (within a few screen pixels). Its paper
+        is see-through, like a PNG, so clicks there reach the character underneath."""
+        x, y, w, h = char_rect(self.p)
+        if not (x <= pos.x() <= x + w and y <= pos.y() <= y + h):
+            return False
+        if self.p.invert:                             # an inverted character is solid
+            return True
+        img = process_char(self.p)[0]
+        Hi, Wi = img.shape
+        views = self.scene().views() if self.scene() else []
+        tol = 4 / views[0].transform().m11() if views else 0.3
+        u, v = (pos.x() - x) / max(w, 1e-6) * Wi, (pos.y() - y) / max(h, 1e-6) * Hi
+        ru, rv = max(1.0, tol / max(w, 1e-6) * Wi), max(1.0, tol / max(h, 1e-6) * Hi)
+        return bool(img[int(max(0, v - rv)):int(min(Hi, v + rv + 1)), int(max(0, u - ru)):int(min(Wi, u + ru + 1))].any())
+
+    def _beneath_has_ink(self, pos: QPointF) -> bool:
+        return any(isinstance(it, CharBox) and it is not self and it.ink_near(pos)
+                   for it in self.scene().items(pos))
+
+    def mousePressEvent(self, e):
+        if not self.ink_near(e.scenePos()) and self._beneath_has_ink(e.scenePos()):
+            e.ignore()                                # let it through to the character below
+            return
+        super().mousePressEvent(e)
+
+    def contextMenuEvent(self, e):
+        if not self.ink_near(e.scenePos()) and self._beneath_has_ink(e.scenePos()):
+            e.ignore()
+            return
+        self.setSelected(True)
+        menu = QtWidgets.QMenu()
+        front = menu.addAction("Bring to front")
+        back = menu.addAction("Send to back")
+        menu.addSeparator()
+        edit = menu.addAction("Edit character…")
+        remove = menu.addAction("Remove")
+        chosen = menu.exec(e.screenPos())
+        if chosen is front or chosen is back:
+            self.composer.restack(self, chosen is front)
+        elif chosen is edit:
+            self.composer.edit_selected()
+        elif chosen is remove:
+            self.composer.remove_selected()
+
     def mouseDoubleClickEvent(self, e):
         self.setSelected(True)
         self.composer.edit_selected()
@@ -2115,7 +2309,7 @@ class CharBox(QtWidgets.QGraphicsRectItem):
 
 
 class BuildView(QtWidgets.QGraphicsView):
-    """The seal being built, in millimetres."""
+    """The seal being built, in millimetres. Scroll to zoom, drag with the middle button to pan."""
 
     def __init__(self, composer):
         super().__init__()
@@ -2123,13 +2317,17 @@ class BuildView(QtWidgets.QGraphicsView):
         self.setScene(QtWidgets.QGraphicsScene(self))
         self.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
         self.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
-        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setTransformationAnchor(QtWidgets.QGraphicsView.ViewportAnchor.AnchorUnderMouse)
         self.setMinimumSize(260, 260)
         self.pix = self.scene().addPixmap(QtGui.QPixmap())
         self.pix.setTransformationMode(Qt.TransformationMode.SmoothTransformation)
         self.outline = self.scene().addPath(QtGui.QPainterPath())
         self.outline.setZValue(1)
+        self.guides = [self.scene().addLine(QtCore.QLineF()) for _ in range(2)]
+        for g in self.guides:
+            g.setZValue(1.5)
+        self.auto_fit = True
+        self.pan = None
         self.retheme()
 
     def retheme(self):
@@ -2137,14 +2335,33 @@ class BuildView(QtWidgets.QGraphicsView):
         pen = QtGui.QPen(QtGui.QColor(C["rule"]), 1, Qt.PenStyle.DashLine)
         pen.setCosmetic(True)
         self.outline.setPen(pen)
+        faint = QtGui.QColor(C["muted"])
+        faint.setAlpha(120)
+        pen = QtGui.QPen(faint, 1, Qt.PenStyle.DotLine)
+        pen.setCosmetic(True)
+        for g in self.guides:
+            g.setPen(pen)
 
     def set_format(self, b: Build):
         path = QtGui.QPainterPath()
-        (path.addEllipse if b.shape == "ellipse" else path.addRect)(QRectF(0, 0, b.w_mm, b.h_mm))
+        r = QRectF(0, 0, b.w_mm, b.h_mm)
+        if b.shape == "ellipse":
+            path.addEllipse(r)
+        elif b.corner_mm > 0:
+            path.addRoundedRect(r, b.corner_mm, b.corner_mm)
+        else:
+            path.addRect(r)
         self.outline.setPath(path)
+        self.guides[0].setLine(b.w_mm / 2, 0, b.w_mm / 2, b.h_mm)      # a faint cross through the middle
+        self.guides[1].setLine(0, b.h_mm / 2, b.w_mm, b.h_mm / 2)
         m = 0.08 * max(b.w_mm, b.h_mm)
         self.scene().setSceneRect(QRectF(-m, -m, b.w_mm + 2 * m, b.h_mm + 2 * m))
-        self.fit()
+        if self.auto_fit:
+            self.fit()
+
+    def show_guides(self, on: bool):
+        for g in self.guides:
+            g.setVisible(on)
 
     def set_image(self, img: QtGui.QImage, px_per_mm: float):
         self.pix.setPixmap(QtGui.QPixmap.fromImage(img))
@@ -2152,10 +2369,52 @@ class BuildView(QtWidgets.QGraphicsView):
 
     def fit(self):
         self.fitInView(self.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
+        self.auto_fit = True
+        if hasattr(self.composer, "timer"):
+            self.composer.schedule()
+
+    def zoom(self, f: float):
+        vr, sr = self.viewport().rect(), self.sceneRect()
+        if self.transform().m11() * f <= min(vr.width() / sr.width(), vr.height() / sr.height()):
+            self.fit()
+            return
+        if self.transform().m11() * f > 400:
+            return
+        self.scale(f, f)
+        self.auto_fit = False
+        self.composer.schedule()                      # sharper picture at the new zoom
 
     def resizeEvent(self, e):
         super().resizeEvent(e)
-        self.fit()
+        if self.auto_fit:
+            self.fit()
+
+    def wheelEvent(self, e):
+        self.zoom(1.15 ** (e.angleDelta().y() / 120.0))
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MouseButton.MiddleButton:
+            self.pan = e.position()
+            self.viewport().setCursor(Qt.CursorShape.ClosedHandCursor)
+            e.accept()
+            return
+        super().mousePressEvent(e)
+
+    def mouseMoveEvent(self, e):
+        if self.pan is not None:
+            d = e.position() - self.pan
+            self.pan = e.position()
+            self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() - int(d.x()))
+            self.verticalScrollBar().setValue(self.verticalScrollBar().value() - int(d.y()))
+            return
+        super().mouseMoveEvent(e)
+
+    def mouseReleaseEvent(self, e):
+        if e.button() == Qt.MouseButton.MiddleButton and self.pan is not None:
+            self.pan = None
+            self.viewport().unsetCursor()
+            return
+        super().mouseReleaseEvent(e)
 
     def keyPressEvent(self, e):
         step = 1.0 if e.modifiers() & Qt.KeyboardModifier.ShiftModifier else 0.1
@@ -2165,6 +2424,12 @@ class BuildView(QtWidgets.QGraphicsView):
             self.composer.remove_selected()
         elif e.key() in moves:
             self.composer.nudge(*moves[e.key()])
+        elif e.key() in (Qt.Key.Key_Plus, Qt.Key.Key_Equal):
+            self.zoom(1.25)
+        elif e.key() == Qt.Key.Key_Minus:
+            self.zoom(0.8)
+        elif e.key() == Qt.Key.Key_0:
+            self.fit()
         else:
             super().keyPressEvent(e)
 
@@ -2253,6 +2518,12 @@ class EditorView(QtWidgets.QGraphicsView):
         pen.setCosmetic(True)
         self.centre = self.scene().addPath(QtGui.QPainterPath(), pen)
         self.centre.setZValue(2)
+        pen = QtGui.QPen(QtGui.QColor(CINNABAR), 1.5)
+        pen.setCosmetic(True)
+        self.brush = self.scene().addEllipse(QRectF(), pen)
+        self.brush.setZValue(4)
+        self.brush.hide()
+        self.setMouseTracking(True)
         self.auto_fit = True
         self.pressed = False
 
@@ -2284,10 +2555,16 @@ class EditorView(QtWidgets.QGraphicsView):
         self.editor.press(self.mapToScene(e.position().toPoint()))
 
     def mouseMoveEvent(self, e):
+        pt = self.mapToScene(e.position().toPoint())
+        self.editor.hover(pt)
         if self.pressed:
-            self.editor.move(self.mapToScene(e.position().toPoint()))
+            self.editor.move(pt)
         else:
             super().mouseMoveEvent(e)
+
+    def leaveEvent(self, e):
+        self.brush.hide()
+        super().leaveEvent(e)
 
     def mouseReleaseEvent(self, e):
         if self.pressed and e.button() == Qt.MouseButton.LeftButton:
@@ -2346,9 +2623,34 @@ class CharacterEditor(QtWidgets.QDialog):
         self.len_timer.setInterval(40)
         self.len_timer.timeout.connect(self._apply_lengthen)
 
+        self.tool = "strokes"
+        self.erase_pts: list = []
+        self.erase_live = None
         outer = QtWidgets.QHBoxLayout(self)
         outer.setSpacing(12)
         left = QtWidgets.QVBoxLayout()
+        tools = QtWidgets.QHBoxLayout()
+        tools.setSpacing(4)
+        tools.addWidget(QtWidgets.QLabel("Tool"))
+        self.tool_buttons = {}
+        for key, label, tip in (("strokes", "Strokes", "Draw along a stroke to select it, then drag it"),
+                                ("erase", "Eraser", "Paint over ink to erase it")):
+            b = QtWidgets.QPushButton(label)
+            b.setCheckable(True)
+            b.setAutoExclusive(True)
+            b.setToolTip(tip)
+            b.clicked.connect(lambda _=False, k=key: self.set_tool(k))
+            tools.addWidget(b)
+            self.tool_buttons[key] = b
+        self.tool_buttons["strokes"].setChecked(True)
+        tools.addSpacing(12)
+        tools.addWidget(QtWidgets.QLabel("Eraser size"))
+        self.sld_brush = slider(1, 20, "How big the eraser is")
+        self.sld_brush.setValue(4)
+        self.sld_brush.setMaximumWidth(160)
+        tools.addWidget(self.sld_brush)
+        tools.addStretch(1)
+        left.addLayout(tools)
         self.view = EditorView(self)
         left.addWidget(self.view, 1)
         self.hint = muted_label()
@@ -2391,6 +2693,10 @@ class CharacterEditor(QtWidgets.QDialog):
         self.lbl_len = QtWidgets.QLabel()
         sv.addLayout(_slider_row(self.sld_len, self.lbl_len))
 
+        row, self.orig_erase = section_with_original("Eraser", "Show the character without what you erased")
+        sv.addLayout(row)
+        sv.addWidget(muted_label("Pick Eraser above the character, then paint over ink to erase it."))
+
         row, self.orig_weight = section_with_original("Weight", "Show the strokes at their original weight")
         sv.addLayout(row)
         self.sld_weight = slider(-5, 5, "Left for thinner strokes, right for bolder")
@@ -2421,6 +2727,7 @@ class CharacterEditor(QtWidgets.QDialog):
         self.orig_squish.setChecked(not w.use_squish)
         self.orig_strokes.setChecked(not w.use_strokes)
         self.orig_lengthen.setChecked(not w.use_lengthen)
+        self.orig_erase.setChecked(not w.use_erase)
         self.orig_weight.setChecked(not w.use_weight)
         self._loading = False
         for s in (self.sld_sq_h, self.sld_sq_v):
@@ -2432,6 +2739,7 @@ class CharacterEditor(QtWidgets.QDialog):
         self.orig_weight.toggled.connect(self.on_originals)
         self.orig_strokes.toggled.connect(self.on_stroke_originals)
         self.orig_lengthen.toggled.connect(self.on_stroke_originals)
+        self.orig_erase.toggled.connect(self.on_stroke_originals)
         self.btn_undo.clicked.connect(self.undo)
         self.btn_restart.clicked.connect(self.start_over)
         undo = QtGui.QShortcut(QtGui.QKeySequence(QtGui.QKeySequence.StandardKey.Undo), self)
@@ -2442,7 +2750,30 @@ class CharacterEditor(QtWidgets.QDialog):
 
     # ---- whole-character settings and the Original switches
     def editable(self) -> bool:
-        return self.work.use_strokes and self.work.use_lengthen
+        return self.work.use_strokes and self.work.use_lengthen and self.work.use_erase
+
+    def set_tool(self, tool: str):
+        self.finish_lengthen()
+        self.tool = tool
+        self.tool_buttons[tool].setChecked(True)
+        if tool == "erase":
+            self.sel = self.centre = self.sel_path = None
+        self.view.brush.setVisible(False)
+        self.update_controls()
+        self.refresh()
+
+    def brush_radius(self) -> float:
+        """The eraser's radius in the character's pixels."""
+        return self.sld_brush.value() / 100 * max(self.work.src.shape)
+
+    def hover(self, pt):
+        if self.tool != "erase" or not self.editable():
+            self.view.brush.hide()
+            return
+        sx, sy = char_scale(self.work)
+        r = self.brush_radius()
+        self.view.brush.setRect(QRectF(pt.x() - r * sx, pt.y() - r * sy, 2 * r * sx, 2 * r * sy))
+        self.view.brush.show()
 
     def update_controls(self):
         w = self.work
@@ -2451,10 +2782,13 @@ class CharacterEditor(QtWidgets.QDialog):
         self.sld_weight.setEnabled(w.use_weight)
         self.btn_undo.setEnabled(self.editable() and bool(self.history))
         self.btn_restart.setEnabled(self.editable() and bool(w.ops))
-        self.sld_len.setEnabled(self.editable() and self.sel is not None)
+        self.sld_len.setEnabled(self.editable() and self.sel is not None and self.tool == "strokes")
         self.lbl_len.setText(f"{self.sld_len.value()}%")
+        self.sld_brush.setEnabled(self.tool == "erase" and self.editable())
         if not self.editable():
-            self.hint.setText("Turn off Original under Strokes and Lengthen to change strokes.")
+            self.hint.setText("Turn off Original under Strokes, Lengthen and Eraser to change strokes.")
+        elif self.tool == "erase":
+            self.hint.setText("Paint over ink to erase it. Ctrl+Z undoes.")
         elif self.sel is None and self.drag is None:
             self.hint.setText("Draw along a stroke, or along just the part of it you want to change, to select it.")
 
@@ -2480,6 +2814,7 @@ class CharacterEditor(QtWidgets.QDialog):
         self.finish_lengthen()
         self.work.use_strokes = not self.orig_strokes.isChecked()
         self.work.use_lengthen = not self.orig_lengthen.isChecked()
+        self.work.use_erase = not self.orig_erase.isChecked()
         QtWidgets.QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
             self.canvas = edit_canvas(self.work)       # replay only the edits that are switched on
@@ -2496,7 +2831,7 @@ class CharacterEditor(QtWidgets.QDialog):
         w = self.work
         g = self.canvas if canvas is None else canvas
         if canvas is None:
-            sel, centre = self.sel, self.centre
+            sel, centre = (self.sel, self.centre) if self.tool == "strokes" else (None, None)
         shown = thicken(g, w.weight, max(w.src.shape)) if w.use_weight else g
         H, W = shown.shape
         sx, sy = char_scale(w)
@@ -2547,6 +2882,11 @@ class CharacterEditor(QtWidgets.QDialog):
             return
         self.finish_lengthen()
         b = self.to_canvas(pt)
+        if self.tool == "erase":
+            self.erase_pts = [b]
+            self.erase_live = erase_mask(self.canvas.shape, [b], self.brush_radius())
+            self.refresh(self.canvas & ~self.erase_live, None, None)
+            return
         if self.sel is not None and self.near_selection(b):
             QtWidgets.QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
             try:
@@ -2562,6 +2902,16 @@ class CharacterEditor(QtWidgets.QDialog):
             self.view.trace.setPath(p)
 
     def move(self, pt):
+        if self.erase_pts:
+            b = self.to_canvas(pt)
+            r = max(1, int(round(self.brush_radius())))
+            m = self.erase_live.view(np.uint8)
+            a = np.round(self.erase_pts[-1]).astype(int)
+            cv2.line(m, (int(a[0]), int(a[1])), (int(round(b[0])), int(round(b[1]))), 1, 2 * r + 1)
+            cv2.circle(m, (int(round(b[0])), int(round(b[1]))), r, 1, -1)
+            self.erase_pts.append(b)
+            self.timer.start()
+            return
         if self.drag is not None:
             self.pending = self.to_canvas(pt) - self.grab_at
             self.timer.start()
@@ -2572,6 +2922,18 @@ class CharacterEditor(QtWidgets.QDialog):
             self.view.trace.setPath(p)
 
     def release(self, pt):
+        if self.erase_pts:
+            self.timer.stop()
+            op = {"kind": "erase", "points": (np.asarray(self.erase_pts) - self.pad).round(2).tolist(),
+                  "radius": round(self.brush_radius(), 2)}
+            self.erase_pts, self.erase_live = [], None
+            self.remember()
+            self.canvas = apply_op(self.canvas, op, self.pad)[0]
+            self.work.ops.append(op)
+            self.sel = self.centre = self.sel_path = None
+            self.update_controls()
+            self.refresh()
+            return
         if self.drag is not None:
             d = self.to_canvas(pt) - self.grab_at
             self.timer.stop()
@@ -2601,7 +2963,9 @@ class CharacterEditor(QtWidgets.QDialog):
         self.refresh()
 
     def _preview(self):
-        if self.drag is not None and self.pending is not None:
+        if self.erase_live is not None:
+            self.refresh(self.canvas & ~self.erase_live, None, None)
+        elif self.drag is not None and self.pending is not None:
             self.refresh(*self.drag.apply(self.pending))
 
     def clear_selection(self):
@@ -2732,8 +3096,16 @@ class Composer(QtWidgets.QWidget):
         self.spn_w, self.spn_h = mm_box(5, 190), mm_box(5, 190)
         self.spn_frame = mm_box(0, 6, 0.1)
         self.spn_frame.setToolTip("Thickness of the frame line. 0 for no frame.")
+        corners = QtWidgets.QHBoxLayout()
+        self.chk_round = QtWidgets.QCheckBox("Round")
+        self.chk_round.setToolTip("Round corners for rectangles, with this radius")
+        self.spn_corner = mm_box(0.2, 40, 0.2)
+        self.spn_corner.setValue(2.0)
+        self.spn_corner.setEnabled(False)
+        corners.addWidget(self.chk_round)
+        corners.addWidget(self.spn_corner, 1)
         for label, w in (("Format", self.cmb_format), ("Shape", self.cmb_shape), ("Width", self.spn_w),
-                         ("Height", self.spn_h), ("Frame", self.spn_frame)):
+                         ("Height", self.spn_h), ("Frame", self.spn_frame), ("Corners", corners)):
             f.addRow(label, w)
         lv.addLayout(f)
         self.chk_white = QtWidgets.QCheckBox("White text (invert the whole seal)")
@@ -2782,6 +3154,14 @@ class Composer(QtWidgets.QWidget):
             self.mode_buttons[key] = b
         self.mode_buttons["scale"].setChecked(True)
         modes.addStretch(1)
+        self.chk_guides = QtWidgets.QCheckBox("Guides")
+        self.chk_guides.setToolTip("A faint cross through the middle of the seal")
+        self.chk_guides.setChecked(True)
+        modes.addWidget(self.chk_guides)
+        fit = QtWidgets.QPushButton("Fit")
+        fit.setToolTip("Show the whole seal again (scroll to zoom, middle-drag to move around)")
+        fit.clicked.connect(self.view.fit)
+        modes.addWidget(fit)
         mid.addLayout(modes)
         row = QtWidgets.QHBoxLayout()
         self.btn_arrange = QtWidgets.QPushButton("Auto-arrange")
@@ -2792,8 +3172,9 @@ class Composer(QtWidgets.QWidget):
             row.addWidget(b)
         row.addStretch(1)
         mid.addLayout(row)
-        mid.addWidget(muted_label("Drag a character to move it and its corners to resize it. Arrow keys nudge, "
-                                  "Delete removes, double-click edits it."))
+        mid.addWidget(muted_label("Drag a character to move it and its corners to resize it; characters may "
+                                  "overlap. Arrow keys nudge, Delete removes, double-click edits, right-click "
+                                  "stacks. Scroll to zoom."))
 
         # right: the selected character
         right, rv = side_panel(max(240, M * 18))
@@ -2822,7 +3203,7 @@ class Composer(QtWidgets.QWidget):
         self.btn_edit_char.setToolTip("Squish it, reshape or lengthen single strokes, change its weight")
         rv.addWidget(self.btn_edit_char)
         rv.addWidget(muted_label("Squish and crop here with the Handles switch under the seal. The character "
-                                 "editor (double-click) does squish, strokes, lengthen and weight."))
+                                 "editor (double-click) does squish, strokes, lengthen, eraser and weight."))
         rv.addStretch(1)
         self.char_controls = (self.spn_cw, self.spn_ch, self.orig_squish, self.orig_crop, self.btn_edit_char,
                               self.btn_remove)
@@ -2858,6 +3239,9 @@ class Composer(QtWidgets.QWidget):
             w.valueChanged.connect(self.on_custom)
         self.spn_frame.valueChanged.connect(self.on_style)
         self.chk_white.toggled.connect(self.on_style)
+        self.chk_round.toggled.connect(self.on_corners)
+        self.spn_corner.valueChanged.connect(self.on_corners)
+        self.chk_guides.toggled.connect(self.view.show_guides)
         self.search.textChanged.connect(self.filter_chars)
         self.chars.itemDoubleClicked.connect(lambda _: self.add_selected())
         self.chars.itemSelectionChanged.connect(
@@ -2963,8 +3347,22 @@ class Composer(QtWidgets.QWidget):
         self.spn_h.setValue(h)
         self._loading = False
 
+    def on_corners(self, *_):
+        if self._loading:
+            return
+        rect = self.build.shape == "rect"
+        self.chk_round.setEnabled(rect)
+        self.spn_corner.setEnabled(rect and self.chk_round.isChecked())
+        self.build.corner_mm = self.spn_corner.value() if (rect and self.chk_round.isChecked()) else 0.0
+        self.view.set_format(self.build)
+        self.schedule()
+
     def apply_format(self, shape, w, h):
         self.build.shape = shape
+        rect = shape == "rect"
+        self.chk_round.setEnabled(rect)
+        self.spn_corner.setEnabled(rect and self.chk_round.isChecked())
+        self.build.corner_mm = self.spn_corner.value() if (rect and self.chk_round.isChecked()) else 0.0
         scale_build(self.build, w, h)
         if self.auto_layout:
             auto_arrange(self.build)
@@ -2996,6 +3394,10 @@ class Composer(QtWidgets.QWidget):
         for b in self.boxes:
             self.view.scene().removeItem(b)
         self.boxes = [CharBox(self, p) for p in self.build.chars]
+        order = sorted(range(len(self.boxes)), key=lambda i: self.build.chars[i].z)
+        for rank, i in enumerate(order):              # stacking on the canvas follows the seal
+            self.boxes[i].base_z = 2.0 + 0.001 * rank
+            self.boxes[i].decorate()
         for b in self.boxes:
             self.view.scene().addItem(b)
         if select is not None and 0 <= select < len(self.boxes):
@@ -3090,6 +3492,12 @@ class Composer(QtWidgets.QWidget):
             self._fill_char_controls(box.p)
             self.schedule()
 
+    def restack(self, box: CharBox, front: bool):
+        zs = [q.z for q in self.build.chars]
+        box.p.z = (max(zs) + 1) if front else (min(zs) - 1)
+        self.sync_boxes(select=self.build.chars.index(box.p))
+        self.schedule()
+
     def remove_selected(self):
         box = self.selected()
         if box is None:
@@ -3118,13 +3526,22 @@ class Composer(QtWidgets.QWidget):
         self.timer.start()
 
     def render(self):
-        k = 640.0 / max(self.build.w_mm, self.build.h_mm)
-        self.view.set_image(ink_to_qimage(render_build(self.build, k)), k)
+        """Draw the seal at the resolution the canvas is zoomed to, see-through outside its shape."""
+        b = self.build
+        zoom = self.view.transform().m11() * self.view.devicePixelRatioF()
+        k = min(60.0, max(640.0 / max(b.w_mm, b.h_mm), zoom))
+        ink = render_build(b, k)
+        H, W = ink.shape
+        rgba = np.empty((H, W, 4), np.uint8)
+        rgba[..., :3] = np.where(ink, 0, 255)[..., None]
+        rgba[..., 3] = np.where(shape_inside(b, W, H, k), 255, 0)
+        img = QtGui.QImage(rgba.data, W, H, 4 * W, QtGui.QImage.Format.Format_RGBA8888).copy()
+        self.view.set_image(img, k)
 
     # ---- starting over, editing, saving
     def clear(self):
         keep = (self.build.shape, self.build.w_mm, self.build.h_mm, self.build.frame_mm, self.build.invert_all)
-        self.build = Build(*keep)
+        self.build = Build(*keep, corner_mm=self.build.corner_mm)
         self.lib_id = None
         self.auto_layout = True
         self.name_typed = False
@@ -3149,6 +3566,11 @@ class Composer(QtWidgets.QWidget):
         self.spn_h.setValue(b.h_mm)
         self.spn_frame.setValue(b.frame_mm)
         self.chk_white.setChecked(b.invert_all)
+        self.chk_round.setChecked(b.corner_mm > 0)
+        if b.corner_mm > 0:
+            self.spn_corner.setValue(b.corner_mm)
+        self.chk_round.setEnabled(b.shape == "rect")
+        self.spn_corner.setEnabled(b.shape == "rect" and b.corner_mm > 0)
         self._loading = False
         self.view.set_format(b)
         self.sync_boxes()

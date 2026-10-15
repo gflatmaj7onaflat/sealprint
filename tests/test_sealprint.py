@@ -3,12 +3,14 @@
     QT_QPA_PLATFORM=offscreen python -m pytest -q
 """
 import json
+import math
 import random
 import re
 import sys
 import zlib
 from pathlib import Path
 
+import cv2
 import numpy as np
 import pytest
 
@@ -244,3 +246,62 @@ def test_builds_from_earlier_versions_still_open(tmp_path):
     assert p.src.shape == (150, 100) and p.weight == 1   # the old lengthening is baked into the picture
     x, y, w, h = sp.char_rect(p)
     assert abs(x + w / 2 - 10) < 0.3 and abs(y + h / 2 - 10) < 0.3 and h > w
+
+
+# ───────────────────────────── outlines, eraser, overlap, round corners
+
+def test_a_hand_drawn_outline_picks_only_what_is_inside():
+    ink = np.zeros((100, 100), bool)
+    ink[20:80, 20:30] = True                             # the character's stroke
+    ink[20:80, 60:70] = True                             # a neighbour inside the bounding box
+    poly = np.array([[10, 10], [45, 10], [45, 90], [10, 90]])
+    mask = np.zeros((100, 100), np.uint8)
+    cv2.fillPoly(mask, [poly.reshape(-1, 1, 2)], 1)
+    g = sp.tidy_glyph(ink & (mask > 0))
+    assert g.sum() == 60 * 10                            # just the stroke inside the outline
+    edge = np.zeros((100, 100), np.uint8)
+    cv2.polylines(edge, [poly.reshape(-1, 1, 2)], True, 1, 3)
+    ink2 = ink.copy()
+    ink2[50:55, 5:15] = True                             # a bit of something the outline cuts through
+    kept = sp.tidy_glyph(ink2 & (mask > 0), True, edge > 0)
+    assert kept.sum() == 60 * 10                         # dropped when asked
+
+
+def test_erasing_can_be_switched_off():
+    g = glyph_cross(200, 20)
+    p = sp.Placed("g", "十", g, cx=10, cy=10, scale=0.05)
+    whole = sp.process_char(p)[0].sum()
+    p.ops = [{"kind": "erase", "points": [[150.0, 99.5], [199.0, 99.5]], "radius": 15}]
+    p.cache = None
+    erased = sp.process_char(p)[0].sum()
+    assert erased < whole - 900                          # the end of the bar is gone
+    p.use_erase = False
+    assert sp.process_char(p)[0].sum() == whole
+
+
+def test_overlapping_characters_show_through_each_other():
+    ring = np.zeros((100, 100), bool)                    # a square outline: paper inside it
+    ring[:10], ring[-10:], ring[:, :10], ring[:, -10:] = True, True, True, True
+    bar = np.zeros((100, 100), bool)
+    bar[45:55, :] = True
+    build = sp.Build("rect", 20, 20, frame_mm=0)
+    a = sp.Placed("a", "a", ring, cx=10, cy=10, scale=0.1)    # px 50-150 at 10 px/mm
+    b = sp.Placed("b", "b", bar, cx=14, cy=10, scale=0.1)     # px 90-190, rows 95-105
+    build.chars = [a, b]
+    ink = sp.render_build(build, 10)
+    assert ink[100, 145] and ink[100, 120] and ink[100, 175] and not ink[80, 100]   # both show
+    a.invert, a.z = True, 1                              # inverted: a solid tile with a white outline,
+    ink = sp.render_build(build, 10)                     # on top it covers the bar
+    assert ink[80, 100] and not ink[100, 145] and ink[100, 175]
+    a.z = -1                                             # underneath, the bar shows across it
+    assert sp.render_build(build, 10)[100, 145]
+
+
+def test_round_corners():
+    b = sp.Build("rect", 20, 20, frame_mm=1.0, corner_mm=4.0)
+    ink = sp.render_build(b, 10)                         # 200 x 200 px, 40 px radius, 10 px frame
+    assert not ink[2, 2] and not ink[8, 8]               # the corner itself is cut away
+    assert ink[0, 100].all() and ink[:10, 100].all()     # straight edges: a 10 px frame
+    assert ink[100, :10].all() and not ink[100, 12]
+    d = 40 - 40 / math.sqrt(2)                           # on the diagonal, the frame follows the curve
+    assert ink[int(d) + 3, int(d) + 3] and not ink[int(d) + 14, int(d) + 14]
