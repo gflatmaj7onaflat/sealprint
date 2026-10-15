@@ -104,3 +104,73 @@ def test_command_line_specs():
     assert sp.parse_spec(oval + ":30:2:other", 20.0, 1) == (oval, 30.0, 2, False)
     with pytest.raises(ValueError):
         sp.parse_spec("missing.png:20:2", 20.0, 1)
+
+
+# ───────────────────────────── characters and builds
+
+def glyph_cross(size=100, bar=12):
+    """A plus sign: one vertical and one horizontal stroke."""
+    g = np.zeros((size, size), bool)
+    g[:, size // 2 - bar // 2:size // 2 + bar // 2] = True
+    g[size // 2 - bar // 2:size // 2 + bar // 2, :] = True
+    return g
+
+
+def test_lengthening_strokes_keeps_their_thickness():
+    p = sp.Placed("g", "十", glyph_cross(), stretch_v=0.5, stretch_v_at=0.2)
+    g, bands = sp.shape_glyph(p)
+    assert g.shape == (150, 100)                         # 50% taller
+    assert g[:, 50].all()                                # the vertical stroke runs the whole new height
+    assert g[:, 10].sum() == 12                          # the horizontal stroke is still 12 px thick
+    assert bands[0] < bands[1]
+
+
+def test_build_frame_shape_and_white_text():
+    b = sp.Build("rect", 20, 20, frame_mm=1.0)
+    p = sp.Placed("g", "十", glyph_cross())
+    b.chars.append(p)
+    sp.auto_arrange(b)
+    ink = sp.render_build(b, 10)                         # 200 x 200 px
+    assert ink.shape == (200, 200)
+    assert ink[:10].all() and ink[:, -10:].all()         # a 1 mm frame is 10 px thick
+    assert not ink[10:13, 10:13].any()                   # paper just inside it
+    assert ink[100, 100]                                 # the character sits in the middle
+    b.invert_all = True
+    white = sp.render_build(b, 10)
+    assert not white[100, 100] and white[30, 30]         # white text: character white, ground black
+    assert white[5, 5] and not white[15, 15]             # solid rim, then the frame as a white line
+    b.shape, b.invert_all, b.frame_mm = "ellipse", False, 0.0
+    oval = sp.render_build(b, 10)
+    assert not oval[0, 0] and not oval[3, 3]             # nothing drawn outside the circle
+
+
+def test_auto_arrange_reads_right_to_left():
+    b = sp.Build("rect", 20, 20, frame_mm=1.0)
+    b.chars = [sp.Placed(str(i), str(i), glyph_cross()) for i in range(4)]
+    sp.auto_arrange(b)
+    first, second, third, fourth = b.chars
+    assert first.cx > third.cx and second.cx > fourth.cx        # first column is on the right
+    assert first.cy < second.cy and third.cy < fourth.cy        # each column top to bottom
+    for p in b.chars:
+        assert 1.0 < p.cx - p.w / 2 and p.cx + p.w / 2 < 19.0   # inside the frame
+
+
+def test_characters_and_builds_round_trip(tmp_path, monkeypatch):
+    monkeypatch.setattr(sp, "LIBRARY", tmp_path / "library")
+    monkeypatch.setattr(sp, "CHARACTERS", tmp_path / "characters")
+    glyph = sp.tidy_glyph(np.pad(glyph_cross(), 30))
+    cid = sp.save_character(glyph, "十", "parent-1", "Test seal", (0.1, 0.1, 0.4, 0.4))
+    [entry] = sp.character_entries()
+    assert entry["name"] == "十" and entry["parent_name"] == "Test seal"
+    assert (sp.png_to_ink(entry["dir"] / "glyph.png") == glyph).all()
+    b = sp.Build("ellipse", 18, 24, frame_mm=0.8)
+    b.chars = [sp.Placed(cid, "十", glyph, stretch_v=0.2, invert=True)]
+    sp.auto_arrange(b)
+    sid = sp.save_build(b, "十字", None)
+    [seal] = sp.library_entries()
+    assert seal["name"] == "十字" and seal["square"] is False and seal["size"] == 24
+    again = sp.load_build(seal)
+    assert (again.shape, again.w_mm, again.h_mm, again.frame_mm) == ("ellipse", 18, 24, 0.8)
+    assert again.chars[0].invert and again.chars[0].stretch_v == 0.2
+    job = sp.job_from_library(seal)
+    assert job.lib_id == sid and job.dims() == pytest.approx((18, 24), abs=0.05)

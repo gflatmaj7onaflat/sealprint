@@ -18,6 +18,9 @@ physical size on A4, ready to transfer onto a seal stone.
 - **Exact size, even on stubborn printers.** For self-service printers that always shrink pages to fit,
   the Enlarge setting compensates, and Calibrate works out the number from a test print.
 - **Seal library.** Save a seal with its frame and settings, then load it onto any later sheet.
+- **Build new seals from characters.** Cut single characters out of saved seals and name them, then
+  compose a new seal from them: pick a format (square, rectangles, circle, oval or your own size), a
+  frame thickness and red or white text, and squash, lengthen, thicken or invert each character.
 - **Close-up inspection.** Click the black-and-white seal to zoom into the exact pixels that get printed.
 - **Two-tone themes.** Dark, Ink, Lacquer, Paper, Celadon, Blue and white, or your own two colours.
 
@@ -59,8 +62,12 @@ warning, then go to **System Settings → Privacy & Security**, scroll down to S
 3. Under **This seal**, choose Square or Other shape, the size in mm (the longest length for other
    shapes) and the number of copies. Stroke weight, Smooth edges and Invert tune the black-and-white
    result. Right-click a seal in the strip to duplicate or remove it.
-4. Click the black-and-white seal to inspect it up close (scroll or + and − to zoom, click to go back).
-5. **Export PDF…**
+4. **Load…** opens the seal library. Under Saved seals, **Pick characters…** lets you drag a box
+   around single characters of the selected seal and name them. **Build from scratch** composes a new
+   seal from those characters; it is saved to the library like any other seal, and **Edit build**
+   reopens it later.
+5. Click the black-and-white seal to inspect it up close (scroll or + and − to zoom, click to go back).
+6. **Export PDF…**
 
 ## Printing
 
@@ -75,13 +82,14 @@ warning, then go to **System Settings → Privacy & Security**, scroll down to S
 
 **Save** keeps the selected seal with its image (cropped around the frame), the frame itself and all
 its settings. **Load…** brings saved seals back. Each seal is a folder with `image.png`, `seal.json`
-and `thumb.png`:
+and `thumb.png` (built seals also keep `build.json` and their characters in `glyphs/`). Characters
+you pick live next to the library in a `characters` folder:
 
-- Linux: `~/.local/share/sealprint/library`
-- Windows: `%LOCALAPPDATA%\sealprint\library`
-- Mac: `~/Library/Application Support/sealprint/library`
+- Linux: `~/.local/share/sealprint`
+- Windows: `%LOCALAPPDATA%\sealprint`
+- Mac: `~/Library/Application Support/sealprint`
 
-Copy that folder to back up your seals or move them to another computer.
+Copy that folder to back up your seals and characters or move them to another computer.
 
 ## Command line
 

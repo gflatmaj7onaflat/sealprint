@@ -29,7 +29,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import QPointF, QRectF, Qt
 
 APP_NAME = "Seal Print"
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 A4_W, A4_H = 210.0, 297.0           # page size, mm
 PAGE_MARGIN = 10.0                  # mm kept clear at the paper edge
 EXPORT_DPI = 1200                   # resolution of the seal image inside the PDF
@@ -396,6 +396,13 @@ class SealJob:
         warped, pps = warp_ink(self.ink(), self.corners, *self.out_px(export_px(max(self.dims()) * scale)))
         return to_black_white(warped, 255 - self.weight, self.smooth * 0.2, pps, self.invert, mirror)
 
+    def render_long(self, long_px: int) -> np.ndarray:
+        """Black/white seal with its long side long_px pixels (True = black), never mirrored."""
+        if self.auto_t:
+            self.weight = int(round(255 - self._warped_preview()[3]))
+        warped, pps = warp_ink(self.ink(), self.corners, *self.out_px(long_px))
+        return to_black_white(warped, 255 - self.weight, self.smooth * 0.2, pps, self.invert, False)
+
     def duplicate(self) -> SealJob:
         return replace(self, corners=self.corners.copy(), lib_id=None)   # shares image and ink maps
 
@@ -471,6 +478,276 @@ def seal_icon(img: QtGui.QImage, px: int) -> QtGui.QIcon:
     icon.addPixmap(pm, QtGui.QIcon.Mode.Normal)
     icon.addPixmap(pm, QtGui.QIcon.Mode.Selected)          # no selection tint on the seal
     return icon
+
+
+# ───────────────────────────────────────────────────────────────── characters and builds
+
+CHARACTERS = LIBRARY.parent / "characters"   # one folder per character picked out of a seal
+BUILD_PX_PER_MM = 50                         # resolution a built seal is saved at
+FORMATS = [                                  # name, shape, width mm, height mm
+    ("Square", "rect", 20.0, 20.0),
+    ("Tall rectangle", "rect", 15.0, 25.0),
+    ("Wide rectangle", "rect", 25.0, 15.0),
+    ("Circle", "ellipse", 20.0, 20.0),
+    ("Oval", "ellipse", 18.0, 24.0),
+]
+
+
+def new_id() -> str:
+    return time.strftime("%Y%m%d-%H%M%S-") + os.urandom(3).hex()
+
+
+def ink_to_png(ink: np.ndarray) -> bytes:
+    ok, png = cv2.imencode(".png", np.where(ink, 0, 255).astype(np.uint8))
+    if not ok:
+        raise OSError("couldn't encode the image")
+    return png.tobytes()
+
+
+def png_to_ink(path) -> np.ndarray:
+    g = cv2.imdecode(np.fromfile(str(path), dtype=np.uint8), cv2.IMREAD_GRAYSCALE)
+    if g is None:
+        raise ValueError(f"can't read {path}")
+    return g < 128
+
+
+def tidy_glyph(ink: np.ndarray, drop_edge_pieces: bool = False) -> np.ndarray | None:
+    """Clean a cropped character: drop specks (and, if asked, bits cut off at the box edge),
+    then trim it to its ink with an even margin. None if nothing is left."""
+    H, W = ink.shape
+    n, lab, st, _ = cv2.connectedComponentsWithStats(ink.astype(np.uint8), connectivity=8)
+    keep = np.zeros(n, bool)
+    for i in range(1, n):
+        x, y, w, h, area = st[i]
+        if area < max(4, H * W * 2e-4):
+            continue
+        if drop_edge_pieces and (x == 0 or y == 0 or x + w >= W or y + h >= H):
+            continue
+        keep[i] = True
+    ink = keep[lab]
+    if not ink.any():
+        return None
+    ys, xs = np.nonzero(ink)
+    ink = ink[ys.min():ys.max() + 1, xs.min():xs.max() + 1]
+    m = max(2, round(0.03 * max(ink.shape)))
+    return np.pad(ink, m)
+
+
+def character_entries() -> list[dict]:
+    """Saved characters, sorted by name. Unreadable entries are skipped."""
+    entries = []
+    if CHARACTERS.is_dir():
+        for d in CHARACTERS.iterdir():
+            try:
+                meta = json.loads((d / "char.json").read_text("utf-8"))
+            except (OSError, ValueError):
+                continue
+            if (d / "glyph.png").is_file():
+                meta["dir"] = d
+                entries.append(meta)
+    entries.sort(key=lambda e: (e.get("name", ""), e.get("saved", "")))
+    return entries
+
+
+def save_character(glyph: np.ndarray, name: str, parent_id: str, parent_name: str, rect) -> str:
+    cid = new_id()
+    d = CHARACTERS / cid
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "glyph.png").write_bytes(ink_to_png(glyph))
+    meta = {"version": 1, "name": name, "parent_id": parent_id, "parent_name": parent_name,
+            "rect": [float(v) for v in rect], "saved": time.strftime("%Y-%m-%d %H:%M:%S")}
+    (d / "char.json").write_text(json.dumps(meta, ensure_ascii=False, indent=1), "utf-8")
+    return cid
+
+
+@dataclass(eq=False)
+class Placed:
+    """A character placed in a build. Positions and sizes are in mm."""
+    glyph_id: str
+    name: str
+    ink: np.ndarray
+    cx: float = 10.0
+    cy: float = 10.0
+    w: float = 8.0
+    h: float = 8.0
+    weight: int = 0                  # -5 (thinner) .. +5 (bolder)
+    stretch_v: float = 0.0           # lengthen vertical strokes by this fraction of the height
+    stretch_v_at: float = 0.5        # ... by stretching the band at this height (0 top, 1 bottom)
+    stretch_h: float = 0.0           # lengthen horizontal strokes by this fraction of the width
+    stretch_h_at: float = 0.5
+    invert: bool = False
+    cache: tuple | None = None
+
+
+PLACED_FIELDS = ("glyph_id", "name", "cx", "cy", "w", "h", "weight",
+                 "stretch_v", "stretch_v_at", "stretch_h", "stretch_h_at", "invert")
+
+
+@dataclass(eq=False)
+class Build:
+    shape: str = "rect"              # "rect" or "ellipse"
+    w_mm: float = 20.0
+    h_mm: float = 20.0
+    frame_mm: float = 1.0            # frame line thickness, 0 for none
+    invert_all: bool = False         # white text (bai wen): ink and paper swapped inside the shape
+    chars: list = field(default_factory=list)
+
+
+def shape_glyph(p: Placed) -> tuple[np.ndarray, tuple]:
+    """The character after stroke weight and lengthening, before it is fitted into its box.
+    Also returns the stretched bands as (v_from, v_to, h_from, h_to), fractions of its size."""
+    key = (p.weight, round(p.stretch_v, 4), round(p.stretch_v_at, 4), round(p.stretch_h, 4), round(p.stretch_h_at, 4))
+    if p.cache is not None and p.cache[0] == key:
+        return p.cache[1], p.cache[2]
+    g = p.ink
+    if p.weight:
+        r = max(1, round(abs(p.weight) * max(g.shape) * 0.005))
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))
+        g8 = np.pad(g.astype(np.uint8), r)            # room to grow, then cut back to size
+        g8 = cv2.dilate(g8, kernel) if p.weight > 0 else cv2.erode(g8, kernel)
+        g = g8[r:-r, r:-r] > 0
+    bands = [0.0, 0.0, 0.0, 0.0]
+    if p.stretch_v > 0:                               # repeat one row: vertical strokes get longer,
+        H = g.shape[0]                                # horizontal ones keep their thickness
+        r, n = min(H - 1, max(0, round(p.stretch_v_at * (H - 1)))), max(1, round(p.stretch_v * H))
+        g = np.concatenate([g[:r], np.repeat(g[r:r + 1], n, axis=0), g[r:]], axis=0)
+        bands[0], bands[1] = r / g.shape[0], (r + n) / g.shape[0]
+    if p.stretch_h > 0:
+        W = g.shape[1]
+        r, n = min(W - 1, max(0, round(p.stretch_h_at * (W - 1)))), max(1, round(p.stretch_h * W))
+        g = np.concatenate([g[:, :r], np.repeat(g[:, r:r + 1], n, axis=1), g[:, r:]], axis=1)
+        bands[2], bands[3] = r / g.shape[1], (r + n) / g.shape[1]
+    p.cache = (key, g, tuple(bands))
+    return g, tuple(bands)
+
+
+def fit_glyph(g: np.ndarray, gw: int, gh: int) -> np.ndarray:
+    shrink = gw < g.shape[1] or gh < g.shape[0]
+    f = cv2.resize(g.astype(np.float32), (gw, gh), interpolation=cv2.INTER_AREA if shrink else cv2.INTER_LINEAR)
+    return f >= 0.5
+
+
+def _ellipse(W: int, H: int, a: float, b: float) -> np.ndarray:
+    if a <= 0 or b <= 0:
+        return np.zeros((H, W), bool)
+    yy, xx = np.mgrid[0:H, 0:W]
+    return ((xx + 0.5 - W / 2) / a) ** 2 + ((yy + 0.5 - H / 2) / b) ** 2 <= 1.0
+
+
+def render_build(b: Build, px_per_mm: float) -> np.ndarray:
+    """The built seal as a bool image (True = black)."""
+    W, H = max(8, round(b.w_mm * px_per_mm)), max(8, round(b.h_mm * px_per_mm))
+    ink = np.zeros((H, W), bool)
+    for p in b.chars:
+        gw, gh = max(1, round(p.w * px_per_mm)), max(1, round(p.h * px_per_mm))
+        g = fit_glyph(shape_glyph(p)[0], gw, gh)
+        if p.invert:
+            g = ~g
+        x0, y0 = round(p.cx * px_per_mm - gw / 2), round(p.cy * px_per_mm - gh / 2)
+        dx0, dy0, dx1, dy1 = max(0, x0), max(0, y0), min(W, x0 + gw), min(H, y0 + gh)
+        if dx1 <= dx0 or dy1 <= dy0:
+            continue
+        part = g[dy0 - y0:dy1 - y0, dx0 - x0:dx1 - x0]
+        if p.invert:
+            ink[dy0:dy1, dx0:dx1] = part
+        else:
+            ink[dy0:dy1, dx0:dx1] |= part
+    t = b.frame_mm * px_per_mm
+    o = t if b.invert_all else 0.0       # white text: the frame becomes a white line set in from a solid rim
+    if b.shape == "ellipse":
+        inside = _ellipse(W, H, W / 2, H / 2)
+        if t > 0:
+            ink |= _ellipse(W, H, W / 2 - o, H / 2 - o) & ~_ellipse(W, H, W / 2 - o - t, H / 2 - o - t)
+    else:
+        inside = np.ones((H, W), bool)
+        if t > 0:
+            a, k = round(o), max(1, round(t))
+            band = np.zeros((H, W), bool)
+            band[a:H - a, a:W - a] = True
+            band[a + k:H - a - k, a + k:W - a - k] = False
+            ink |= band
+    return (~ink & inside) if b.invert_all else (ink & inside)
+
+
+def auto_arrange(b: Build):
+    """Fill the seal with its characters in reading order: columns from right to left, each
+    column top to bottom, like a traditional seal."""
+    n = len(b.chars)
+    if not n:
+        return
+    edge = b.frame_mm * (2 if b.invert_all else 1) + 0.06 * min(b.w_mm, b.h_mm)
+    aw, ah = max(1.0, b.w_mm - 2 * edge), max(1.0, b.h_mm - 2 * edge)
+    if b.shape == "ellipse":                         # the largest rectangle inside the oval
+        aw, ah = aw / math.sqrt(2), ah / math.sqrt(2)
+    x0, y0 = (b.w_mm - aw) / 2, (b.h_mm - ah) / 2
+    if n == 1:
+        columns = [1]
+    elif aw / ah > 1.4:                              # wide: one row
+        columns = [1] * n
+    elif aw / ah < 0.7:                              # tall: one column
+        columns = [n]
+    elif n == 3:                                     # right column one character, left column two
+        columns = [1, 2]
+    else:
+        cols = math.ceil(math.sqrt(n))
+        rows = math.ceil(n / cols)
+        columns = [rows] * (n // rows) + ([n % rows] if n % rows else [])
+    gap = 0.04 * min(aw, ah)
+    colw = (aw - gap * (len(columns) - 1)) / len(columns)
+    chars = iter(b.chars)
+    for c, k in enumerate(columns):
+        x = x0 + aw - (c + 1) * colw - c * gap
+        cellh = (ah - gap * (k - 1)) / k
+        for i in range(k):
+            p = next(chars)
+            p.cx, p.cy, p.w, p.h = x + colw / 2, y0 + i * (cellh + gap) + cellh / 2, colw, cellh
+
+
+def scale_build(b: Build, w_mm: float, h_mm: float):
+    """Change the format's size, keeping the characters where they are relative to it."""
+    fx, fy = w_mm / b.w_mm, h_mm / b.h_mm
+    for p in b.chars:
+        p.cx, p.w, p.cy, p.h = p.cx * fx, p.w * fx, p.cy * fy, p.h * fy
+    b.w_mm, b.h_mm = w_mm, h_mm
+
+
+def save_build(b: Build, name: str, lib_id: str | None = None) -> str:
+    """Save a build as an ordinary seal in the library (so it prints and loads like any
+    other), plus its layout so it can be edited again. Returns the seal's id."""
+    ink = render_build(b, BUILD_PX_PER_MM)
+    H, W = ink.shape
+    rgb = np.repeat(np.where(ink, 0, 255).astype(np.uint8)[:, :, None], 3, axis=2)
+    job = SealJob(rgb, name, size=max(b.w_mm, b.h_mm), smooth=1, ink_choice="dark", mode="dark",
+                  frame_manual=True, corners=whole_image_corners(W, H), square=abs(b.w_mm - b.h_mm) < 1e-6,
+                  ratio=min(W, H) / max(W, H), lib_id=lib_id)
+    job.update_preview(False)
+    save_to_library(job, name)
+    d = LIBRARY / job.lib_id
+    layout = {"version": 1, "shape": b.shape, "w_mm": b.w_mm, "h_mm": b.h_mm, "frame_mm": b.frame_mm,
+              "invert_all": b.invert_all, "chars": [{k: getattr(p, k) for k in PLACED_FIELDS} for p in b.chars]}
+    (d / "build.json").write_text(json.dumps(layout, ensure_ascii=False, indent=1), "utf-8")
+    gd = d / "glyphs"                                # its own copy of each character
+    gd.mkdir(exist_ok=True)
+    used = {p.glyph_id for p in b.chars}
+    for p in b.chars:
+        (gd / f"{p.glyph_id}.png").write_bytes(ink_to_png(p.ink))
+    for f in gd.glob("*.png"):
+        if f.stem not in used:
+            f.unlink()
+    return job.lib_id
+
+
+def load_build(entry: dict) -> Build:
+    d = Path(entry["dir"])
+    data = json.loads((d / "build.json").read_text("utf-8"))
+    b = Build(data["shape"], data["w_mm"], data["h_mm"], data["frame_mm"], data["invert_all"])
+    for c in data["chars"]:
+        p = Placed(c["glyph_id"], c["name"], png_to_ink(d / "glyphs" / f"{c['glyph_id']}.png"))
+        for k in PLACED_FIELDS[2:]:
+            if k in c:
+                setattr(p, k, c[k])
+        b.chars.append(p)
+    return b
 
 
 # ───────────────────────────────────────────────────────────────── layout and PDF
@@ -1056,14 +1333,923 @@ class SealStrip(QtWidgets.QListWidget):
                        "Each seal you add shows up here. They all go into the same PDF.")
 
 
+class PickView(QtWidgets.QGraphicsView):
+    """A seal in black and white. Drag a box around a character; scroll to zoom."""
+    boxDrawn = QtCore.Signal(QRectF)          # in image pixels
+    pickClicked = QtCore.Signal(str)          # id of a saved character that was clicked
+
+    def __init__(self, img: QtGui.QImage):
+        super().__init__()
+        self.setScene(QtWidgets.QGraphicsScene(self))
+        self.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+        self.setTransformationAnchor(QtWidgets.QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+        self.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        self.setBackgroundBrush(QtGui.QColor(C["well"]))
+        self.viewport().setCursor(Qt.CursorShape.CrossCursor)
+        pix = self.scene().addPixmap(QtGui.QPixmap.fromImage(img))
+        pix.setTransformationMode(Qt.TransformationMode.SmoothTransformation)
+        self.img_size = QtCore.QSizeF(img.width(), img.height())
+        m = 0.04 * max(img.width(), img.height())
+        self.scene().setSceneRect(QRectF(-m, -m, img.width() + 2 * m, img.height() + 2 * m))
+        pen = QtGui.QPen(QtGui.QColor(CINNABAR), 2)
+        pen.setCosmetic(True)
+        self.box = self.scene().addRect(QRectF(), pen, QtGui.QBrush(QtGui.QColor(216, 69, 47, 45)))
+        self.box.setZValue(5)
+        self.box.hide()
+        self.picks = []
+        self.start = None
+        self.auto_fit = True
+
+    def show_picks(self, picks):
+        """Outline the characters already saved from this seal: (id, name, normalised rect)."""
+        for item in self.picks:
+            self.scene().removeItem(item)
+        self.picks = []
+        W, H = self.img_size.width(), self.img_size.height()
+        for cid, name, (x, y, w, h) in picks:
+            pen = QtGui.QPen(QtGui.QColor(CINNABAR), 1.5, Qt.PenStyle.DashLine)
+            pen.setCosmetic(True)
+            r = self.scene().addRect(QRectF(x * W, y * H, w * W, h * H), pen)
+            r.setData(0, cid)
+            r.setZValue(3)
+            label = QtWidgets.QGraphicsSimpleTextItem(name)
+            label.setBrush(QtGui.QColor(CINNABAR))
+            label.setFlag(QtWidgets.QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations)
+            label.setPos(x * W, y * H)
+            label.setZValue(4)
+            self.scene().addItem(label)
+            self.picks += [r, label]
+
+    def clear_box(self):
+        self.box.hide()
+
+    def fit(self):
+        self.fitInView(self.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
+        self.auto_fit = True
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        if self.auto_fit:
+            self.fit()
+
+    def wheelEvent(self, e):
+        f = 1.15 ** (e.angleDelta().y() / 120.0)
+        vr, sr = self.viewport().rect(), self.sceneRect()
+        if self.transform().m11() * f <= min(vr.width() / sr.width(), vr.height() / sr.height()):
+            self.fit()
+            return
+        self.scale(f, f)
+        self.auto_fit = False
+
+    def mousePressEvent(self, e):
+        if e.button() != Qt.MouseButton.LeftButton:
+            return super().mousePressEvent(e)
+        self.start = self.mapToScene(e.position().toPoint())
+        self.box.setRect(QRectF(self.start, self.start))
+        self.box.show()
+
+    def mouseMoveEvent(self, e):
+        if self.start is None:
+            return super().mouseMoveEvent(e)
+        self.box.setRect(QRectF(self.start, self.mapToScene(e.position().toPoint())).normalized())
+
+    def mouseReleaseEvent(self, e):
+        if self.start is None or e.button() != Qt.MouseButton.LeftButton:
+            return super().mouseReleaseEvent(e)
+        end = self.mapToScene(e.position().toPoint())
+        r = QRectF(self.start, end).normalized().intersected(QRectF(QPointF(0, 0), self.img_size))
+        self.start = None
+        if r.width() < 4 or r.height() < 4:            # a click: was it on a saved character?
+            self.box.hide()
+            for item in self.picks:
+                if isinstance(item, QtWidgets.QGraphicsRectItem) and item.rect().contains(end):
+                    self.pickClicked.emit(item.data(0))
+                    break
+            return
+        self.box.setRect(r)
+        self.boxDrawn.emit(r)
+
+
+def glyph_icon(path, px: int) -> QtGui.QIcon:
+    img = QtGui.QImage(str(path))
+    return seal_icon(img, px) if not img.isNull() else QtGui.QIcon()
+
+
+class CharacterPicker(QtWidgets.QDialog):
+    """Cut single characters out of a saved seal and name them."""
+
+    def __init__(self, parent, entry: dict):
+        super().__init__(parent)
+        self.parent_id = Path(entry["dir"]).name
+        self.parent_name = entry.get("name") or self.parent_id
+        self.setWindowTitle(f"Pick characters from “{self.parent_name}”")
+        QtWidgets.QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            self.ink = job_from_library(entry).render_long(1600)
+        finally:
+            QtWidgets.QApplication.restoreOverrideCursor()
+        self.crop = self.rect = None
+        h = QtWidgets.QHBoxLayout(self)
+        h.setSpacing(12)
+        self.view = PickView(ink_to_qimage(self.ink))
+        h.addWidget(self.view, 1)
+        side = QtWidgets.QVBoxLayout()
+        side.setSpacing(8)
+        h.addLayout(side)
+        fm = self.fontMetrics()
+        width = max(240, fm.horizontalAdvance("M") * 19)
+        self.hint = muted_label("Drag a box around one character. Scroll to zoom.")
+        self.hint.setFixedWidth(width)
+        side.addWidget(self.hint)
+        self.preview = QtWidgets.QLabel()
+        self.preview.setFixedSize(width, min(width, 170))
+        self.preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.preview.setObjectName("glyphpreview")
+        side.addWidget(self.preview)
+        self.name = QtWidgets.QLineEdit()
+        self.name.setPlaceholderText("Which character is it?")
+        self.name.returnPressed.connect(self.save)
+        self.name.textChanged.connect(lambda _: self._buttons())
+        side.addWidget(self.name)
+        self.chk_flip = QtWidgets.QCheckBox("White strokes: flip them to black")
+        self.chk_flip.setToolTip("For white-text seals, so the strokes become the ink of the character")
+        self.chk_edge = QtWidgets.QCheckBox("Drop bits cut off at the box edge")
+        self.chk_edge.setToolTip("Removes pieces of the frame or of neighbouring characters that the box clipped")
+        for c in (self.chk_flip, self.chk_edge):
+            c.toggled.connect(self._show_preview)
+            side.addWidget(c)
+        self.btn_save = QtWidgets.QPushButton("Save character")
+        self.btn_save.setObjectName("primary")
+        self.btn_save.clicked.connect(self.save)
+        side.addWidget(self.btn_save)
+        side.addWidget(section_label("From this seal"))
+        self.list = QtWidgets.QListWidget()
+        self.list.setObjectName("library")
+        self.list.setViewMode(QtWidgets.QListView.ViewMode.IconMode)
+        self.list.setMovement(QtWidgets.QListView.Movement.Static)
+        self.list.setResizeMode(QtWidgets.QListView.ResizeMode.Adjust)
+        self.list.setIconSize(QtCore.QSize(40, 40))
+        self.list.setGridSize(QtCore.QSize(64, 40 + fm.height() + 16))
+        self.list.setFixedWidth(width)
+        self.list.itemSelectionChanged.connect(self._buttons)
+        side.addWidget(self.list, 1)
+        row = QtWidgets.QHBoxLayout()
+        self.btn_delete = QtWidgets.QPushButton("Delete")
+        self.btn_delete.clicked.connect(self.delete)
+        done = QtWidgets.QPushButton("Done")
+        done.clicked.connect(self.accept)
+        row.addWidget(self.btn_delete)
+        row.addStretch(1)
+        row.addWidget(done)
+        side.addLayout(row)
+        self.view.boxDrawn.connect(self.on_box)
+        self.view.pickClicked.connect(self.select_pick)
+        fit_to_screen(self, 980, 660)
+        self.refresh()
+        self._show_preview()
+
+    def on_box(self, r: QRectF):
+        H, W = self.ink.shape
+        x0, y0 = max(0, int(r.left())), max(0, int(r.top()))
+        x1, y1 = min(W, int(math.ceil(r.right()))), min(H, int(math.ceil(r.bottom())))
+        self.crop = self.ink[y0:y1, x0:x1]
+        self.rect = (x0 / W, y0 / H, (x1 - x0) / W, (y1 - y0) / H)
+        self.chk_flip.blockSignals(True)
+        self.chk_flip.setChecked(bool(self.crop.mean() > 0.55))     # mostly black: white strokes
+        self.chk_flip.blockSignals(False)
+        self._show_preview()
+        self.name.setFocus()
+
+    def glyph(self):
+        if self.crop is None:
+            return None
+        return tidy_glyph(~self.crop if self.chk_flip.isChecked() else self.crop, self.chk_edge.isChecked())
+
+    def _show_preview(self, *_):
+        g = self.glyph()
+        if g is None:
+            self.preview.setPixmap(QtGui.QPixmap())
+            self.preview.setText("" if self.crop is None else "Nothing left in that box")
+        else:
+            img = ink_to_qimage(g).scaled(self.preview.size() * self.devicePixelRatioF(),
+                                          Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+            pm = QtGui.QPixmap.fromImage(img)
+            pm.setDevicePixelRatio(self.devicePixelRatioF())
+            self.preview.setPixmap(pm)
+        self._buttons()
+
+    def _buttons(self):
+        self.btn_save.setEnabled(self.glyph() is not None and bool(self.name.text().strip()))
+        self.btn_delete.setEnabled(bool(self.list.selectedItems()))
+
+    def save(self):
+        g, name = self.glyph(), self.name.text().strip()
+        if g is None:
+            return
+        if not name:
+            self.name.setFocus()
+            return
+        save_character(g, name, self.parent_id, self.parent_name, self.rect)
+        self.crop = self.rect = None
+        self.view.clear_box()
+        self.name.clear()
+        self.hint.setText(f"Saved “{name}”. Drag a box around the next one.")
+        self.refresh()
+        self._show_preview()
+
+    def refresh(self):
+        self.list.clear()
+        mine = [e for e in character_entries() if e.get("parent_id") == self.parent_id]
+        for e in mine:
+            item = QtWidgets.QListWidgetItem(glyph_icon(e["dir"] / "glyph.png", 80), e.get("name", ""))
+            item.setData(Qt.ItemDataRole.UserRole, str(e["dir"]))
+            self.list.addItem(item)
+        self.view.show_picks([(e["dir"].name, e.get("name", ""), e.get("rect", (0, 0, 0, 0))) for e in mine])
+        self._buttons()
+
+    def select_pick(self, cid: str):
+        for i in range(self.list.count()):
+            item = self.list.item(i)
+            item.setSelected(Path(item.data(Qt.ItemDataRole.UserRole)).name == cid)
+
+    def delete(self):
+        items = self.list.selectedItems()
+        if not items:
+            return
+        what = f"“{items[0].text()}”" if len(items) == 1 else f"{len(items)} characters"
+        if QtWidgets.QMessageBox.question(self, "Delete characters", f"Delete {what}? This can't be undone.") \
+                != QtWidgets.QMessageBox.StandardButton.Yes:
+            return
+        for item in items:
+            shutil.rmtree(item.data(Qt.ItemDataRole.UserRole), ignore_errors=True)
+        self.refresh()
+
+
+class ResizeHandle(QtWidgets.QGraphicsRectItem):
+    """A corner of a character's box. Drag to resize; Shift keeps the proportions."""
+
+    def __init__(self, box, corner: int):
+        super().__init__(-5, -5, 10, 10, box)
+        self.box, self.corner = box, corner
+        self.setFlag(QtWidgets.QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations)
+        self.setBrush(QtGui.QColor("#ffffff"))
+        self.setPen(QtGui.QPen(QtGui.QColor(CINNABAR), 1.5))
+        self.setCursor(Qt.CursorShape.SizeFDiagCursor if corner in (0, 2) else Qt.CursorShape.SizeBDiagCursor)
+        self.setZValue(10)
+        self.anchor = None
+
+    def mousePressEvent(self, e):
+        r = self.box.scene_rect()
+        self.anchor = [r.bottomRight(), r.bottomLeft(), r.topLeft(), r.topRight()][self.corner]
+        self.aspect = r.width() / max(r.height(), 1e-6)
+        e.accept()
+
+    def mouseMoveEvent(self, e):
+        if self.anchor is None:
+            return
+        dx, dy = e.scenePos().x() - self.anchor.x(), e.scenePos().y() - self.anchor.y()
+        w, h = max(1.0, abs(dx)), max(1.0, abs(dy))
+        if e.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+            h = w / self.aspect
+        x = self.anchor.x() if dx >= 0 else self.anchor.x() - w
+        y = self.anchor.y() if dy >= 0 else self.anchor.y() - h
+        self.box.set_scene_rect(QRectF(x, y, w, h))
+
+    def mouseReleaseEvent(self, e):
+        self.anchor = None
+
+
+class CharBox(QtWidgets.QGraphicsRectItem):
+    """The box of one placed character: drag it to move, drag a corner to squash or stretch."""
+
+    def __init__(self, composer, p: Placed):
+        super().__init__()
+        self.composer, self.p = composer, p
+        F = QtWidgets.QGraphicsItem.GraphicsItemFlag
+        self.setFlags(F.ItemIsMovable | F.ItemIsSelectable | F.ItemSendsGeometryChanges)
+        self.setBrush(QtGui.QBrush(Qt.GlobalColor.transparent))
+        self.setCursor(Qt.CursorShape.SizeAllCursor)
+        self.setZValue(2)
+        self.bands = []
+        for _ in range(2):                       # where strokes were lengthened
+            band = QtWidgets.QGraphicsRectItem(self)
+            band.setPen(QtGui.QPen(Qt.PenStyle.NoPen))
+            band.setBrush(QtGui.QColor(216, 69, 47, 55))
+            self.bands.append(band)
+        self.handles = [ResizeHandle(self, i) for i in range(4)]
+        self._silent = False
+        self.sync()
+
+    def scene_rect(self) -> QRectF:
+        return QRectF(self.pos(), self.rect().size())
+
+    def sync(self):
+        """Move and size the box to match its character."""
+        self._silent = True
+        self.setPos(self.p.cx - self.p.w / 2, self.p.cy - self.p.h / 2)
+        self.setRect(0, 0, self.p.w, self.p.h)
+        self._silent = False
+        self.decorate()
+
+    def set_scene_rect(self, r: QRectF):
+        self.p.cx, self.p.cy, self.p.w, self.p.h = r.center().x(), r.center().y(), r.width(), r.height()
+        self.sync()
+        self.composer.box_changed(self)
+
+    def decorate(self):
+        sel = self.isSelected()
+        w, h = self.p.w, self.p.h
+        for handle, (x, y) in zip(self.handles, [(0, 0), (w, 0), (w, h), (0, h)]):
+            handle.setPos(x, y)
+            handle.setVisible(sel)
+        pen = QtGui.QPen(QtGui.QColor(CINNABAR if sel else C["muted"]), 1.5 if sel else 1,
+                         Qt.PenStyle.DashLine if sel else Qt.PenStyle.DotLine)
+        pen.setCosmetic(True)
+        self.setPen(pen)
+        self.setZValue(3 if sel else 2)
+        v0, v1, h0, h1 = shape_glyph(self.p)[1]
+        self.bands[0].setRect(0, v0 * h, w, (v1 - v0) * h)
+        self.bands[0].setVisible(sel and self.p.stretch_v > 0)
+        self.bands[1].setRect(h0 * w, 0, (h1 - h0) * w, h)
+        self.bands[1].setVisible(sel and self.p.stretch_h > 0)
+
+    def itemChange(self, change, value):
+        GC = QtWidgets.QGraphicsItem.GraphicsItemChange
+        if change == GC.ItemPositionHasChanged and not self._silent:
+            self.p.cx, self.p.cy = self.pos().x() + self.p.w / 2, self.pos().y() + self.p.h / 2
+            self.composer.box_changed(self)
+        elif change == GC.ItemSelectedHasChanged:
+            if self.isSelected():                 # one character at a time
+                for other in self.composer.boxes:
+                    if other is not self and other.isSelected():
+                        other.setSelected(False)
+            self.decorate()
+        return super().itemChange(change, value)
+
+
+class BuildView(QtWidgets.QGraphicsView):
+    """The seal being built, in millimetres."""
+
+    def __init__(self, composer):
+        super().__init__()
+        self.composer = composer
+        self.setScene(QtWidgets.QGraphicsScene(self))
+        self.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+        self.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setMinimumSize(260, 260)
+        self.pix = self.scene().addPixmap(QtGui.QPixmap())
+        self.pix.setTransformationMode(Qt.TransformationMode.SmoothTransformation)
+        self.outline = self.scene().addPath(QtGui.QPainterPath())
+        self.outline.setZValue(1)
+        self.retheme()
+
+    def retheme(self):
+        self.setBackgroundBrush(QtGui.QColor(C["well"]))
+        pen = QtGui.QPen(QtGui.QColor(C["rule"]), 1, Qt.PenStyle.DashLine)
+        pen.setCosmetic(True)
+        self.outline.setPen(pen)
+
+    def set_format(self, b: Build):
+        path = QtGui.QPainterPath()
+        (path.addEllipse if b.shape == "ellipse" else path.addRect)(QRectF(0, 0, b.w_mm, b.h_mm))
+        self.outline.setPath(path)
+        m = 0.08 * max(b.w_mm, b.h_mm)
+        self.scene().setSceneRect(QRectF(-m, -m, b.w_mm + 2 * m, b.h_mm + 2 * m))
+        self.fit()
+
+    def set_image(self, img: QtGui.QImage, px_per_mm: float):
+        self.pix.setPixmap(QtGui.QPixmap.fromImage(img))
+        self.pix.setScale(1.0 / px_per_mm)
+
+    def fit(self):
+        self.fitInView(self.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self.fit()
+
+    def keyPressEvent(self, e):
+        step = 1.0 if e.modifiers() & Qt.KeyboardModifier.ShiftModifier else 0.1
+        moves = {Qt.Key.Key_Left: (-step, 0), Qt.Key.Key_Right: (step, 0),
+                 Qt.Key.Key_Up: (0, -step), Qt.Key.Key_Down: (0, step)}
+        if e.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
+            self.composer.remove_selected()
+        elif e.key() in moves:
+            self.composer.nudge(*moves[e.key()])
+        else:
+            super().keyPressEvent(e)
+
+
+def section_label(text: str) -> QtWidgets.QLabel:
+    lab = QtWidgets.QLabel(text)
+    lab.setObjectName("section")
+    return lab
+
+
+def muted_label(text: str = "") -> QtWidgets.QLabel:
+    lab = QtWidgets.QLabel(text)
+    lab.setObjectName("muted")
+    lab.setWordWrap(True)
+    return lab
+
+
+def fit_to_screen(w: QtWidgets.QWidget, width: int, height: int):
+    screen = w.screen() or QtWidgets.QApplication.primaryScreen()
+    geo = screen.availableGeometry() if screen else QtCore.QRect(0, 0, 1280, 800)
+    w.resize(min(width, int(geo.width() * 0.94)), min(height, int(geo.height() * 0.9)))
+
+
+def side_panel(width: int) -> tuple[QtWidgets.QScrollArea, QtWidgets.QVBoxLayout]:
+    inner = QtWidgets.QWidget()
+    inner.setObjectName("sideinner")
+    v = QtWidgets.QVBoxLayout(inner)
+    v.setContentsMargins(2, 0, 10, 0)
+    v.setSpacing(7)
+    scroll = QtWidgets.QScrollArea()
+    scroll.setObjectName("sidescroll")
+    scroll.setWidget(inner)
+    scroll.setWidgetResizable(True)
+    scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+    scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+    scroll.viewport().setAutoFillBackground(False)
+    scroll.setFixedWidth(width)
+    return scroll, v
+
+
+def slider(lo: int, hi: int, tip: str = "") -> QtWidgets.QSlider:
+    s = QtWidgets.QSlider(Qt.Orientation.Horizontal)
+    s.setRange(lo, hi)
+    s.setToolTip(tip)
+    return s
+
+
+def mm_box(lo: float, hi: float, step: float = 0.5) -> QtWidgets.QDoubleSpinBox:
+    b = QtWidgets.QDoubleSpinBox()
+    b.setRange(lo, hi)
+    b.setDecimals(1)
+    b.setSingleStep(step)
+    b.setSuffix(" mm")
+    return b
+
+
+class Composer(QtWidgets.QWidget):
+    """Build a seal out of saved characters."""
+    saved = QtCore.Signal(dict, bool)          # library entry, and whether to add it to the sheet
+    cancelled = QtCore.Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.build = Build()
+        self.lib_id: str | None = None         # set once saved, so saving again updates it
+        self.auto_layout = True                # arrange automatically until a box is moved by hand
+        self.name_typed = False
+        self.boxes: list[CharBox] = []
+        self._loading = False
+        self.timer = QtCore.QTimer(self)
+        self.timer.setSingleShot(True)
+        self.timer.setInterval(20)
+        self.timer.timeout.connect(self.render)
+        fm = self.fontMetrics()
+        M = fm.horizontalAdvance("M")
+
+        # left: format, then the characters to choose from
+        left, lv = side_panel(max(250, M * 20))
+        lv.addWidget(section_label("Format"))
+        f = QtWidgets.QFormLayout()
+        f.setHorizontalSpacing(10)
+        self.cmb_format = QtWidgets.QComboBox()
+        for name, *_ in FORMATS:
+            self.cmb_format.addItem(name)
+        self.cmb_format.addItem("Custom")
+        self.cmb_shape = QtWidgets.QComboBox()
+        self.cmb_shape.addItem("Rectangle", "rect")
+        self.cmb_shape.addItem("Ellipse", "ellipse")
+        self.spn_w, self.spn_h = mm_box(5, 190), mm_box(5, 190)
+        self.spn_frame = mm_box(0, 6, 0.1)
+        self.spn_frame.setToolTip("Thickness of the frame line. 0 for no frame.")
+        for label, w in (("Format", self.cmb_format), ("Shape", self.cmb_shape), ("Width", self.spn_w),
+                         ("Height", self.spn_h), ("Frame", self.spn_frame)):
+            f.addRow(label, w)
+        lv.addLayout(f)
+        self.chk_white = QtWidgets.QCheckBox("White text (invert the whole seal)")
+        self.chk_white.setToolTip("Bai wen: the ground becomes ink and the characters are cut out of it")
+        lv.addWidget(self.chk_white)
+        lv.addWidget(section_label("Characters"))
+        self.search = QtWidgets.QLineEdit()
+        self.search.setPlaceholderText("Search by character or seal")
+        self.search.setClearButtonEnabled(True)
+        lv.addWidget(self.search)
+        self.chars = QtWidgets.QListWidget()
+        self.chars.setObjectName("library")
+        self.chars.setViewMode(QtWidgets.QListView.ViewMode.IconMode)
+        self.chars.setMovement(QtWidgets.QListView.Movement.Static)
+        self.chars.setResizeMode(QtWidgets.QListView.ResizeMode.Adjust)
+        self.chars.setIconSize(QtCore.QSize(48, 48))
+        self.char_tile = QtCore.QSize(max(76, M * 6), 48 + 2 * fm.height() + 18)
+        self.chars.setGridSize(self.char_tile + QtCore.QSize(4, 4))
+        self.chars.setMinimumHeight(self.char_tile.height() * 2 + 20)
+        self.chars.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        lv.addWidget(self.chars, 1)
+        self.chars_empty = muted_label("No characters yet. In the Saved seals tab, select a seal and press "
+                                       "Pick characters… to cut some out.")
+        lv.addWidget(self.chars_empty)
+        self.btn_add_char = QtWidgets.QPushButton("Add to seal")
+        self.btn_add_char.setToolTip("Or double-click a character")
+        lv.addWidget(self.btn_add_char)
+
+        # middle: the seal itself
+        mid = QtWidgets.QVBoxLayout()
+        self.view = BuildView(self)
+        mid.addWidget(self.view, 1)
+        row = QtWidgets.QHBoxLayout()
+        self.btn_arrange = QtWidgets.QPushButton("Auto-arrange")
+        self.btn_arrange.setToolTip("Lay the characters out in reading order: columns from right to left")
+        self.btn_remove = QtWidgets.QPushButton("Remove")
+        self.btn_clear = QtWidgets.QPushButton("Start over")
+        for b in (self.btn_arrange, self.btn_remove, self.btn_clear):
+            row.addWidget(b)
+        row.addStretch(1)
+        mid.addLayout(row)
+        mid.addWidget(muted_label("Drag a character to move it, drag its corners to squash or stretch it "
+                                  "(Shift keeps its proportions). Arrow keys nudge, Delete removes."))
+
+        # right: the selected character
+        right, rv = side_panel(max(240, M * 18))
+        rv.addWidget(section_label("Selected character"))
+        self.lbl_char = QtWidgets.QLabel("Click a character to adjust it")
+        self.lbl_char.setObjectName("muted")
+        self.lbl_char.setWordWrap(True)
+        rv.addWidget(self.lbl_char)
+        self.big_font = QtGui.QFont(self.font())
+        self.big_font.setPointSizeF(self.font().pointSizeF() * 2.2)
+        f = QtWidgets.QFormLayout()
+        f.setHorizontalSpacing(10)
+        self.spn_cw, self.spn_ch = mm_box(1, 190, 0.1), mm_box(1, 190, 0.1)
+        f.addRow("Width", self.spn_cw)
+        f.addRow("Height", self.spn_ch)
+        rv.addLayout(f)
+        rv.addWidget(QtWidgets.QLabel("Lengthen strokes"))
+        rv.addWidget(muted_label("Stretches one band of the character, so it gets taller or wider while "
+                                 "its strokes stay as thick. Move “at” to a gap between strokes."))
+        f = QtWidgets.QFormLayout()
+        f.setHorizontalSpacing(10)
+        self.sld_v = slider(0, 100, "How much longer the vertical strokes get")
+        self.sld_v_at = slider(0, 100, "Where the character is stretched, from top to bottom")
+        self.sld_h = slider(0, 100, "How much longer the horizontal strokes get")
+        self.sld_h_at = slider(0, 100, "Where the character is stretched, from left to right")
+        f.addRow("Vertical", self.sld_v)
+        f.addRow("at", self.sld_v_at)
+        f.addRow("Horizontal", self.sld_h)
+        f.addRow("at", self.sld_h_at)
+        rv.addLayout(f)
+        rv.addWidget(QtWidgets.QLabel("Stroke weight"))
+        self.sld_weight = slider(-5, 5, "Left for thinner strokes, right for bolder")
+        rv.addWidget(self.sld_weight)
+        self.chk_invert = QtWidgets.QCheckBox("Invert this character")
+        rv.addWidget(self.chk_invert)
+        rv.addStretch(1)
+        self.char_controls = (self.spn_cw, self.spn_ch, self.sld_v, self.sld_v_at, self.sld_h, self.sld_h_at,
+                              self.sld_weight, self.chk_invert, self.btn_remove)
+
+        body = QtWidgets.QHBoxLayout()
+        body.setSpacing(14)
+        body.addWidget(left)
+        body.addLayout(mid, 1)
+        body.addWidget(right)
+        bottom = QtWidgets.QHBoxLayout()
+        self.name = QtWidgets.QLineEdit()
+        self.name.setPlaceholderText("Name of this seal")
+        self.name.textEdited.connect(lambda _: setattr(self, "name_typed", True))
+        self.btn_save = QtWidgets.QPushButton("Save")
+        self.btn_save.setToolTip("Save it to the library; it shows up under Saved seals")
+        self.btn_save_add = QtWidgets.QPushButton("Save and add to sheet")
+        self.btn_save_add.setObjectName("primary")
+        cancel = QtWidgets.QPushButton("Cancel")
+        bottom.addWidget(QtWidgets.QLabel("Name"))
+        bottom.addWidget(self.name, 1)
+        bottom.addWidget(cancel)
+        bottom.addWidget(self.btn_save)
+        bottom.addWidget(self.btn_save_add)
+        outer = QtWidgets.QVBoxLayout(self)
+        outer.setContentsMargins(10, 12, 10, 10)
+        outer.addLayout(body, 1)
+        outer.addLayout(bottom)
+
+        self.cmb_format.currentIndexChanged.connect(self.on_format)
+        for w in (self.cmb_shape,):
+            w.currentIndexChanged.connect(self.on_custom)
+        for w in (self.spn_w, self.spn_h):
+            w.valueChanged.connect(self.on_custom)
+        self.spn_frame.valueChanged.connect(self.on_style)
+        self.chk_white.toggled.connect(self.on_style)
+        self.search.textChanged.connect(self.filter_chars)
+        self.chars.itemDoubleClicked.connect(lambda _: self.add_selected())
+        self.chars.itemSelectionChanged.connect(
+            lambda: self.btn_add_char.setEnabled(bool(self.chars.selectedItems())))
+        self.chars.customContextMenuRequested.connect(self.char_menu)
+        self.btn_add_char.clicked.connect(self.add_selected)
+        self.btn_arrange.clicked.connect(self.arrange)
+        self.btn_remove.clicked.connect(self.remove_selected)
+        self.btn_clear.clicked.connect(self.clear)
+        self.view.scene().selectionChanged.connect(self.on_select)
+        for w in (self.spn_cw, self.spn_ch):
+            w.valueChanged.connect(self.on_char_edit)
+        for w in (self.sld_v, self.sld_v_at, self.sld_h, self.sld_h_at, self.sld_weight):
+            w.valueChanged.connect(self.on_char_edit)
+        self.chk_invert.toggled.connect(self.on_char_edit)
+        self.btn_save.clicked.connect(lambda: self.save(False))
+        self.btn_save_add.clicked.connect(lambda: self.save(True))
+        cancel.clicked.connect(self.cancelled.emit)
+
+        self.on_format(0)
+        self.spn_frame.setValue(self.build.frame_mm)
+        self.refresh_characters()
+        self.on_select()
+
+    # ---- the characters to choose from
+    def refresh_characters(self):
+        self.chars.clear()
+        entries = character_entries()
+        fm = self.chars.fontMetrics()
+        for e in entries:
+            name, parent = e.get("name", ""), e.get("parent_name", "")
+            item = QtWidgets.QListWidgetItem(glyph_icon(e["dir"] / "glyph.png", 96), name + "\n" +
+                                             fm.elidedText(parent, Qt.TextElideMode.ElideRight, self.char_tile.width() - 8))
+            item.setToolTip(f"{name}\nfrom {parent}")
+            item.setSizeHint(self.char_tile)
+            item.setData(Qt.ItemDataRole.UserRole, str(e["dir"]))
+            item.setData(Qt.ItemDataRole.UserRole + 1, f"{name}\n{parent}".lower())
+            self.chars.addItem(item)
+        self.chars.setVisible(bool(entries))
+        self.search.setEnabled(bool(entries))
+        self.chars_empty.setVisible(not entries)
+        self.btn_add_char.setEnabled(False)
+        self.filter_chars(self.search.text())
+
+    def filter_chars(self, text):
+        text = text.strip().lower()
+        for i in range(self.chars.count()):
+            item = self.chars.item(i)
+            item.setHidden(bool(text) and text not in item.data(Qt.ItemDataRole.UserRole + 1))
+
+    def char_menu(self, pos):
+        item = self.chars.itemAt(pos)
+        if item is None:
+            return
+        menu = QtWidgets.QMenu(self)
+        delete = menu.addAction("Delete character")
+        if menu.exec(self.chars.viewport().mapToGlobal(pos)) is delete:
+            name = item.text().split("\n")[0]
+            if QtWidgets.QMessageBox.question(self, "Delete character", f"Delete “{name}”? Seals already "
+                                              f"built with it keep their own copy.") \
+                    == QtWidgets.QMessageBox.StandardButton.Yes:
+                shutil.rmtree(item.data(Qt.ItemDataRole.UserRole), ignore_errors=True)
+                self.refresh_characters()
+
+    def add_selected(self):
+        for item in self.chars.selectedItems():
+            d = Path(item.data(Qt.ItemDataRole.UserRole))
+            try:
+                meta = json.loads((d / "char.json").read_text("utf-8"))
+                p = Placed(d.name, meta.get("name", ""), png_to_ink(d / "glyph.png"))
+            except (OSError, ValueError):
+                continue
+            side = 0.45 * min(self.build.w_mm, self.build.h_mm)
+            gh, gw = p.ink.shape
+            p.w, p.h = (side, side * gh / gw) if gw >= gh else (side * gw / gh, side)
+            p.cx, p.cy = self.build.w_mm / 2, self.build.h_mm / 2
+            self.build.chars.append(p)
+        if self.auto_layout:
+            auto_arrange(self.build)
+        self.sync_boxes(select=len(self.build.chars) - 1)
+        self.update_name()
+        self.schedule()
+
+    # ---- the seal's format
+    def on_format(self, index):
+        if self._loading:
+            return
+        if index < len(FORMATS):
+            _, shape, w, h = FORMATS[index]
+            self._set_format_widgets(shape, w, h)
+            self.apply_format(shape, w, h)
+
+    def on_custom(self, *_):
+        if self._loading:
+            return
+        self._loading = True
+        self.cmb_format.setCurrentIndex(len(FORMATS))
+        self._loading = False
+        self.apply_format(self.cmb_shape.currentData(), self.spn_w.value(), self.spn_h.value())
+
+    def _set_format_widgets(self, shape, w, h):
+        self._loading = True
+        self.cmb_shape.setCurrentIndex(0 if shape == "rect" else 1)
+        self.spn_w.setValue(w)
+        self.spn_h.setValue(h)
+        self._loading = False
+
+    def apply_format(self, shape, w, h):
+        self.build.shape = shape
+        scale_build(self.build, w, h)
+        if self.auto_layout:
+            auto_arrange(self.build)
+        self.view.set_format(self.build)
+        self.sync_boxes()
+        self.schedule()
+
+    def on_style(self, *_):
+        if self._loading:
+            return
+        self.build.frame_mm = self.spn_frame.value()
+        self.build.invert_all = self.chk_white.isChecked()
+        if self.auto_layout:
+            auto_arrange(self.build)
+            self.sync_boxes()
+        self.schedule()
+
+    def arrange(self):
+        self.auto_layout = True
+        auto_arrange(self.build)
+        self.sync_boxes()
+        self.schedule()
+
+    # ---- placed characters
+    def sync_boxes(self, select: int | None = None):
+        if select is None:
+            sel = self.selected()
+            select = self.build.chars.index(sel.p) if sel is not None and sel.p in self.build.chars else None
+        for b in self.boxes:
+            self.view.scene().removeItem(b)
+        self.boxes = [CharBox(self, p) for p in self.build.chars]
+        for b in self.boxes:
+            self.view.scene().addItem(b)
+        if select is not None and 0 <= select < len(self.boxes):
+            self.boxes[select].setSelected(True)
+        self.on_select()
+
+    def selected(self) -> CharBox | None:
+        for b in self.boxes:
+            if b.isSelected():
+                return b
+        return None
+
+    def box_changed(self, box: CharBox):
+        self.auto_layout = False               # placed by hand from now on
+        if box is self.selected():
+            self._fill_char_controls(box.p)
+        self.schedule()
+
+    def on_select(self):
+        box = self.selected()
+        for w in self.char_controls:
+            w.setEnabled(box is not None)
+        if box is None:
+            self.lbl_char.setFont(self.font())
+            self.lbl_char.setText("Click a character on the seal to adjust it" if self.boxes else
+                                  "Add characters from the list on the left")
+            return
+        self.lbl_char.setFont(self.big_font)
+        self.lbl_char.setText(box.p.name)
+        self._fill_char_controls(box.p)
+
+    def _fill_char_controls(self, p: Placed):
+        self._loading = True
+        self.spn_cw.setValue(p.w)
+        self.spn_ch.setValue(p.h)
+        self.sld_v.setValue(round(p.stretch_v * 100))
+        self.sld_v_at.setValue(round(p.stretch_v_at * 100))
+        self.sld_h.setValue(round(p.stretch_h * 100))
+        self.sld_h_at.setValue(round(p.stretch_h_at * 100))
+        self.sld_weight.setValue(p.weight)
+        self.chk_invert.setChecked(p.invert)
+        self._loading = False
+
+    def on_char_edit(self, *_):
+        box = self.selected()
+        if self._loading or box is None:
+            return
+        p = box.p
+        if (p.w, p.h) != (self.spn_cw.value(), self.spn_ch.value()):
+            p.w, p.h = self.spn_cw.value(), self.spn_ch.value()
+            self.auto_layout = False
+        sv, sh = self.sld_v.value() / 100, self.sld_h.value() / 100
+        if sv != p.stretch_v or sh != p.stretch_h:        # the character grows by what is added,
+            p.h *= (1 + sv) / (1 + p.stretch_v)           # so the rest of it keeps its scale
+            p.w *= (1 + sh) / (1 + p.stretch_h)
+            self.auto_layout = False
+            self._loading = True
+            self.spn_cw.setValue(p.w)
+            self.spn_ch.setValue(p.h)
+            self._loading = False
+        p.stretch_v, p.stretch_v_at = sv, self.sld_v_at.value() / 100
+        p.stretch_h, p.stretch_h_at = sh, self.sld_h_at.value() / 100
+        p.weight = self.sld_weight.value()
+        p.invert = self.chk_invert.isChecked()
+        box.sync()
+        self.schedule()
+
+    def remove_selected(self):
+        box = self.selected()
+        if box is None:
+            return
+        i = self.build.chars.index(box.p)
+        self.build.chars.pop(i)
+        if self.auto_layout:
+            auto_arrange(self.build)
+        self.sync_boxes(select=min(i, len(self.build.chars) - 1) if self.build.chars else None)
+        self.update_name()
+        self.schedule()
+
+    def nudge(self, dx, dy):
+        box = self.selected()
+        if box is not None:
+            box.p.cx += dx
+            box.p.cy += dy
+            box.sync()
+            self.box_changed(box)
+
+    def update_name(self):
+        if not self.name_typed:
+            self.name.setText("".join(p.name for p in self.build.chars))
+
+    def schedule(self):
+        self.timer.start()
+
+    def render(self):
+        k = 640.0 / max(self.build.w_mm, self.build.h_mm)
+        self.view.set_image(ink_to_qimage(render_build(self.build, k)), k)
+
+    # ---- starting over, editing, saving
+    def clear(self):
+        keep = (self.build.shape, self.build.w_mm, self.build.h_mm, self.build.frame_mm, self.build.invert_all)
+        self.build = Build(*keep)
+        self.lib_id = None
+        self.auto_layout = True
+        self.name_typed = False
+        self.name.clear()
+        self.sync_boxes()
+        self.schedule()
+
+    def load(self, entry: dict):
+        """Open a seal built earlier so it can be changed."""
+        self.build = load_build(entry)
+        self.lib_id = Path(entry["dir"]).name
+        self.auto_layout = False
+        self.name_typed = True
+        self.name.setText(entry.get("name", ""))
+        b = self.build
+        preset = next((i for i, (_, s, w, h) in enumerate(FORMATS) if (s, w, h) == (b.shape, b.w_mm, b.h_mm)),
+                      len(FORMATS))
+        self._loading = True
+        self.cmb_format.setCurrentIndex(preset)
+        self.cmb_shape.setCurrentIndex(0 if b.shape == "rect" else 1)
+        self.spn_w.setValue(b.w_mm)
+        self.spn_h.setValue(b.h_mm)
+        self.spn_frame.setValue(b.frame_mm)
+        self.chk_white.setChecked(b.invert_all)
+        self._loading = False
+        self.view.set_format(b)
+        self.sync_boxes()
+        self.schedule()
+
+    def save(self, add: bool):
+        if not self.build.chars:
+            QtWidgets.QMessageBox.information(self, APP_NAME, "Add at least one character first.")
+            return
+        name = self.name.text().strip() or "".join(p.name for p in self.build.chars) or "Built seal"
+        QtWidgets.QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            self.lib_id = save_build(self.build, name, self.lib_id)
+        except Exception as ex:
+            QtWidgets.QApplication.restoreOverrideCursor()
+            QtWidgets.QMessageBox.warning(self, APP_NAME, f"Couldn't save the seal.\n{ex}")
+            return
+        QtWidgets.QApplication.restoreOverrideCursor()
+        entry = next((e for e in library_entries() if e["dir"].name == self.lib_id), None)
+        if entry is not None:
+            self.saved.emit(entry, add)
+
+
 class LibraryDialog(QtWidgets.QDialog):
-    """Pick saved seals to put back on the sheet."""
+    """Saved seals to put back on the sheet, characters picked out of them, and seals built
+    from those characters."""
     THUMB = 96
 
     def __init__(self, parent):
         super().__init__(parent)
-        self.setWindowTitle("Saved seals")
-        v = QtWidgets.QVBoxLayout(self)
+        self.setWindowTitle("Seal library")
+        self.picked: list[dict] | None = None
+        outer = QtWidgets.QVBoxLayout(self)
+        outer.setContentsMargins(10, 10, 10, 10)
+        self.tabs = QtWidgets.QTabWidget()
+        outer.addWidget(self.tabs)
+
+        saved = QtWidgets.QWidget()
+        v = QtWidgets.QVBoxLayout(saved)
+        v.setContentsMargins(10, 12, 10, 10)
         v.setSpacing(10)
         self.search = QtWidgets.QLineEdit()
         self.search.setPlaceholderText("Search by name")
@@ -1085,7 +2271,8 @@ class LibraryDialog(QtWidgets.QDialog):
         self.grid.itemDoubleClicked.connect(self.accept)
         self.grid.itemSelectionChanged.connect(self._selection)
         v.addWidget(self.grid, 1)
-        self.empty = QtWidgets.QLabel("Nothing saved yet. Select a seal on the sheet and press Save to keep it here.")
+        self.empty = QtWidgets.QLabel("Nothing saved yet. Select a seal on the sheet and press Save to keep it "
+                                      "here, or build one in the Build from scratch tab.")
         self.empty.setObjectName("muted")
         self.empty.setWordWrap(True)
         self.empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -1097,24 +2284,40 @@ class LibraryDialog(QtWidgets.QDialog):
         self.btn_delete = QtWidgets.QPushButton("Delete")
         self.btn_delete.setToolTip("Delete the selected seals from the library")
         self.btn_delete.clicked.connect(self._delete)
+        self.btn_pick = QtWidgets.QPushButton("Pick characters…")
+        self.btn_pick.setToolTip("Cut single characters out of the selected seal, to build new seals with")
+        self.btn_pick.clicked.connect(self._pick_characters)
+        self.btn_edit = QtWidgets.QPushButton("Edit build")
+        self.btn_edit.setToolTip("Change a seal you built from characters")
+        self.btn_edit.clicked.connect(self._edit_build)
         cancel = QtWidgets.QPushButton("Cancel")
         cancel.clicked.connect(self.reject)
         self.btn_add = QtWidgets.QPushButton("Add to sheet")
         self.btn_add.setObjectName("primary")
         self.btn_add.setDefault(True)
         self.btn_add.clicked.connect(self.accept)
-        for b in (self.btn_folder, self.btn_delete):
+        for b in (self.btn_folder, self.btn_delete, self.btn_pick, self.btn_edit):
             row.addWidget(b)
         row.addStretch(1)
         row.addWidget(cancel)
         row.addWidget(self.btn_add)
         v.addLayout(row)
-        self.resize(self.tile.width() * 5 + 90, self.tile.height() * 3 + 170)
+        self.tabs.addTab(saved, "Saved seals")
+
+        self.composer = Composer(self)
+        self.composer.saved.connect(self._built)
+        self.composer.cancelled.connect(self.reject)
+        self.tabs.addTab(self.composer, "Build from scratch")
+        self.tabs.currentChanged.connect(lambda i: self.composer.refresh_characters() if i == 1 else None)
+        fit_to_screen(self, 1180, 760)
         self._populate()
 
     def _populate(self):
         self.grid.clear()
         entries = library_entries()
+        counts: dict[str, int] = {}
+        for c in character_entries():
+            counts[c.get("parent_id", "")] = counts.get(c.get("parent_id", ""), 0) + 1
         fm = self.grid.fontMetrics()
         for e in entries:
             name = e.get("name") or e["dir"].name
@@ -1122,7 +2325,10 @@ class LibraryDialog(QtWidgets.QDialog):
             item = QtWidgets.QListWidgetItem(
                 fm.elidedText(name, Qt.TextElideMode.ElideRight, self.tile.width() - 12) + "\n"
                 + (f"{size} mm" if e.get("square", True) else f"longest {size} mm"))
-            item.setToolTip(f"{name}\nSaved {e.get('saved', '')}")
+            n = counts.get(e["dir"].name, 0)
+            built = (e["dir"] / "build.json").is_file()
+            item.setToolTip(f"{name}\nSaved {e.get('saved', '')}" + ("\nBuilt from characters" if built else "")
+                            + (f"\n{plural(n, 'character')} picked from it" if n else ""))
             item.setSizeHint(self.tile)
             item.setData(Qt.ItemDataRole.UserRole, str(e["dir"]))
             item.setData(Qt.ItemDataRole.UserRole + 1, name.lower())
@@ -1147,22 +2353,56 @@ class LibraryDialog(QtWidgets.QDialog):
             item = self.grid.item(i)
             item.setHidden(bool(text) and text not in item.data(Qt.ItemDataRole.UserRole + 1))
 
+    def _selected(self) -> list[dict]:
+        return [self.entries[it.data(Qt.ItemDataRole.UserRole)] for it in self.grid.selectedItems()]
+
     def _selection(self):
-        n = len(self.grid.selectedItems())
+        picked = self._selected()
+        n = len(picked)
         self.btn_add.setEnabled(n > 0)
         self.btn_delete.setEnabled(n > 0)
+        self.btn_pick.setEnabled(n == 1)
+        self.btn_edit.setEnabled(n == 1 and (picked[0]["dir"] / "build.json").is_file())
         self.btn_add.setText("Add to sheet" if n < 2 else f"Add {n} to sheet")
 
     def chosen(self) -> list[dict]:
-        return [self.entries[it.data(Qt.ItemDataRole.UserRole)] for it in self.grid.selectedItems()]
+        return self.picked if self.picked is not None else self._selected()
+
+    def _pick_characters(self):
+        picked = self._selected()
+        if len(picked) != 1:
+            return
+        try:
+            picker = CharacterPicker(self, picked[0])
+        except Exception as ex:
+            QtWidgets.QMessageBox.warning(self, APP_NAME, f"Couldn't open that seal.\n{ex}")
+            return
+        picker.exec()
+        self._populate()
+        self.composer.refresh_characters()
+
+    def _edit_build(self):
+        picked = self._selected()
+        if len(picked) == 1:
+            self.composer.load(picked[0])
+            self.tabs.setCurrentIndex(1)
+
+    def _built(self, entry: dict, add: bool):
+        self._populate()
+        if add:
+            self.picked = [entry]
+            self.accept()
+        else:
+            self.window().setWindowTitle(f"Seal library: saved “{entry.get('name')}”")
 
     def _delete(self):
-        picked = self.chosen()
+        picked = self._selected()
         if not picked:
             return
         what = f"“{picked[0].get('name')}”" if len(picked) == 1 else f"{len(picked)} saved seals"
         sure = QtWidgets.QMessageBox.question(self, "Delete saved seals",
-                                              f"Delete {what} from the library? This can't be undone.")
+                                              f"Delete {what} from the library? This can't be undone. "
+                                              f"Characters picked from it stay in your character list.")
         if sure != QtWidgets.QMessageBox.StandardButton.Yes:
             return
         for e in picked:
@@ -1366,6 +2606,12 @@ QListWidget#strip::item, QListWidget#library::item {{ color: {c['muted']}; borde
 QListWidget#strip::item:hover, QListWidget#library::item:hover {{ background: {c['item_hover']}; }}
 QListWidget#strip::item:selected, QListWidget#library::item:selected {{ background: {c['item_sel']};
     color: {c['text']}; border: 1px solid {c['accent']}; }}
+QTabWidget::pane {{ border: 1px solid {c['rule']}; border-radius: 6px; top: -1px; background: {c['side']}; }}
+QTabBar::tab {{ background: {c['button']}; color: {c['muted']}; border: 1px solid {c['border']}; border-bottom: none;
+    border-top-left-radius: 6px; border-top-right-radius: 6px; padding: 6px 16px; margin-right: 3px; }}
+QTabBar::tab:selected {{ background: {c['side']}; color: {c['text']}; border-color: {c['rule']}; }}
+QTabBar::tab:hover {{ color: {c['text']}; }}
+QLabel#glyphpreview {{ background: #ffffff; color: #666666; border: 1px solid {c['rule']}; border-radius: 4px; }}
 QLineEdit {{ background: {c['field']}; color: {c['text']}; border: 1px solid {c['border']}; border-radius: 5px;
     padding: 5px 8px; }}
 QLineEdit:focus {{ border-color: {c['accent_label']}; }}
