@@ -29,7 +29,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import QPointF, QRectF, Qt
 
 APP_NAME = "Seal Print"
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 A4_W, A4_H = 210.0, 297.0           # page size, mm
 PAGE_MARGIN = 10.0                  # mm kept clear at the paper edge
 EXPORT_DPI = 1200                   # resolution of the seal image inside the PDF
@@ -576,11 +576,16 @@ class Placed:
     stretch_h: float = 0.0           # lengthen horizontal strokes by this fraction of the width
     stretch_h_at: float = 0.5
     invert: bool = False
+    ref_px: float = 0.0              # the character's original size in pixels; stroke weight is relative to it
     cache: tuple | None = None
+
+    def __post_init__(self):
+        if not self.ref_px:
+            self.ref_px = float(max(self.ink.shape))
 
 
 PLACED_FIELDS = ("glyph_id", "name", "cx", "cy", "w", "h", "weight",
-                 "stretch_v", "stretch_v_at", "stretch_h", "stretch_h_at", "invert")
+                 "stretch_v", "stretch_v_at", "stretch_h", "stretch_h_at", "invert", "ref_px")
 
 
 @dataclass(eq=False)
@@ -593,32 +598,193 @@ class Build:
     chars: list = field(default_factory=list)
 
 
+def stretch_rows(p: Placed) -> tuple[int, int, int, int]:
+    """Where a character is lengthened: (row, rows added, column, columns added)."""
+    H, W = p.ink.shape
+    rv = min(H - 1, max(0, round(p.stretch_v_at * (H - 1))))
+    rh = min(W - 1, max(0, round(p.stretch_h_at * (W - 1))))
+    nv = max(1, round(p.stretch_v * H)) if p.stretch_v > 0 else 0
+    nh = max(1, round(p.stretch_h * W)) if p.stretch_h > 0 else 0
+    return rv, nv, rh, nh
+
+
+def stretch_array(g: np.ndarray, p: Placed) -> np.ndarray:
+    """Repeat one row and one column, as the lengthening of p asks: strokes crossing them get
+    longer while every other stroke keeps its thickness."""
+    rv, nv, rh, nh = stretch_rows(p)
+    if nv:
+        g = np.concatenate([g[:rv], np.repeat(g[rv:rv + 1], nv, axis=0), g[rv:]], axis=0)
+    if nh:
+        g = np.concatenate([g[:, :rh], np.repeat(g[:, rh:rh + 1], nh, axis=1), g[:, rh:]], axis=1)
+    return g
+
+
 def shape_glyph(p: Placed) -> tuple[np.ndarray, tuple]:
     """The character after stroke weight and lengthening, before it is fitted into its box.
     Also returns the stretched bands as (v_from, v_to, h_from, h_to), fractions of its size."""
-    key = (p.weight, round(p.stretch_v, 4), round(p.stretch_v_at, 4), round(p.stretch_h, 4), round(p.stretch_h_at, 4))
+    key = (id(p.ink), p.ink.shape, p.weight, round(p.stretch_v, 5), round(p.stretch_v_at, 5),
+           round(p.stretch_h, 5), round(p.stretch_h_at, 5))
     if p.cache is not None and p.cache[0] == key:
         return p.cache[1], p.cache[2]
     g = p.ink
     if p.weight:
-        r = max(1, round(abs(p.weight) * max(g.shape) * 0.005))
+        r = max(1, round(abs(p.weight) * (p.ref_px or max(g.shape)) * 0.005))
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))
         g8 = np.pad(g.astype(np.uint8), r)            # room to grow, then cut back to size
         g8 = cv2.dilate(g8, kernel) if p.weight > 0 else cv2.erode(g8, kernel)
         g = g8[r:-r, r:-r] > 0
-    bands = [0.0, 0.0, 0.0, 0.0]
-    if p.stretch_v > 0:                               # repeat one row: vertical strokes get longer,
-        H = g.shape[0]                                # horizontal ones keep their thickness
-        r, n = min(H - 1, max(0, round(p.stretch_v_at * (H - 1)))), max(1, round(p.stretch_v * H))
-        g = np.concatenate([g[:r], np.repeat(g[r:r + 1], n, axis=0), g[r:]], axis=0)
-        bands[0], bands[1] = r / g.shape[0], (r + n) / g.shape[0]
-    if p.stretch_h > 0:
-        W = g.shape[1]
-        r, n = min(W - 1, max(0, round(p.stretch_h_at * (W - 1)))), max(1, round(p.stretch_h * W))
-        g = np.concatenate([g[:, :r], np.repeat(g[:, r:r + 1], n, axis=1), g[:, r:]], axis=1)
-        bands[2], bands[3] = r / g.shape[1], (r + n) / g.shape[1]
-    p.cache = (key, g, tuple(bands))
-    return g, tuple(bands)
+    g = stretch_array(g, p)
+    rv, nv, rh, nh = stretch_rows(p)
+    bands = (rv / g.shape[0], (rv + nv) / g.shape[0], rh / g.shape[1], (rh + nh) / g.shape[1])
+    p.cache = (key, g, bands)
+    return g, bands
+
+
+def resize_canvas(p: Placed, top: int, bottom: int, left: int, right: int):
+    """Add (positive) or cut away (negative) paper around a character without moving or
+    rescaling what is drawn: its box, centre and lengthening are adjusted to match."""
+    rv, nv, rh, nh = stretch_rows(p)
+    H, W = p.ink.shape
+    sx, sy = p.w / (W + nh), p.h / (H + nv)           # mm per pixel, kept as it is
+    g = np.pad(p.ink, ((max(top, 0), max(bottom, 0)), (max(left, 0), max(right, 0))))
+    g = g[max(-top, 0):g.shape[0] - max(-bottom, 0), max(-left, 0):g.shape[1] - max(-right, 0)]
+    p.ink = np.ascontiguousarray(g)
+    H2, W2 = g.shape
+    if nv:
+        p.stretch_v, p.stretch_v_at = nv / H2, min(1.0, max(0.0, (rv + top) / max(H2 - 1, 1)))
+    if nh:
+        p.stretch_h, p.stretch_h_at = nh / W2, min(1.0, max(0.0, (rh + left) / max(W2 - 1, 1)))
+    p.w, p.h = (W2 + nh) * sx, (H2 + nv) * sy
+    p.cx += (right - left) * sx / 2
+    p.cy += (bottom - top) * sy / 2
+    p.cache = None
+
+
+def _resample(points: np.ndarray, step: float) -> np.ndarray:
+    """Points spaced evenly along a polyline."""
+    pts = np.asarray(points, dtype=np.float64).reshape(-1, 2)
+    keep = np.r_[True, np.hypot(*np.diff(pts, axis=0).T) > 1e-9]
+    pts = pts[keep]
+    if len(pts) < 2:
+        return pts
+    s = np.r_[0.0, np.cumsum(np.hypot(*np.diff(pts, axis=0).T))]
+    n = max(2, int(math.ceil(s[-1] / step)) + 1)
+    t = np.linspace(0.0, s[-1], n)
+    return np.column_stack([np.interp(t, s, pts[:, 0]), np.interp(t, s, pts[:, 1])])
+
+
+def _nearest_param(c: np.ndarray, s: np.ndarray, P: np.ndarray) -> np.ndarray:
+    """For each point of P, how far along the polyline c (arc lengths s) its nearest point is."""
+    A, AB = c[:-1], np.diff(c, axis=0)
+    L2 = (AB ** 2).sum(1) + 1e-9
+    out = np.empty(len(P), np.float32)
+    for i in range(0, len(P), 4096):
+        q = P[i:i + 4096, None, :]
+        t = np.clip(((q - A) * AB).sum(2) / L2, 0.0, 1.0)
+        d2 = ((q - (A + t[..., None] * AB)) ** 2).sum(2)
+        j = d2.argmin(1)
+        out[i:i + 4096] = s[j] + t[np.arange(len(j)), j] * np.sqrt(L2[j])
+    return out
+
+
+def select_stroke(ink: np.ndarray, path) -> tuple[np.ndarray, np.ndarray] | None:
+    """Best guess at the stroke (or the part of one) a path was drawn along: the ink within
+    about one stroke width of the path, plus a smoothed centreline. None if the path missed."""
+    pts = _resample(path, 1.0)
+    if len(pts) < 3:
+        return None
+    H, W = ink.shape
+    dt = cv2.distanceTransform(ink.astype(np.uint8), cv2.DIST_L2, 5)
+    k = max(2, round(0.025 * max(H, W)))
+    local = cv2.dilate(dt, np.ones((2 * k + 1, 2 * k + 1), np.uint8))   # stroke half-width nearby
+    xi = np.clip(np.round(pts[:, 0]).astype(int), 0, W - 1)
+    yi = np.clip(np.round(pts[:, 1]).astype(int), 0, H - 1)
+    half = local[yi, xi]
+    half = half[half > 0]
+    if half.size < 2:
+        return None
+    hw = float(np.median(half))
+    ks = max(1, int(round(hw)))                       # move the path onto the middle of its stroke,
+    snapped = []                                      # wherever across the stroke it was drawn
+    for x, y in pts:
+        xc, yc = int(round(x)), int(round(y))
+        x0, x1, y0, y1 = max(0, xc - ks), min(W, xc + ks + 1), max(0, yc - ks), min(H, yc + ks + 1)
+        win = dt[y0:y1, x0:x1]
+        if win.size and win.max() > 0:
+            j = np.unravel_index(int(win.argmax()), win.shape)
+            snapped.append((x0 + j[1], y0 + j[0]))
+        else:
+            snapped.append((x, y))
+    pts = np.asarray(snapped, dtype=np.float64)
+    r = 1.3 * hw + 2.0
+    reach, core = np.zeros((H, W), np.uint8), np.zeros((H, W), np.uint8)
+    for x, y in pts[::2]:
+        c = (int(round(x)), int(round(y)))
+        cv2.circle(reach, c, int(round(r)), 1, -1)
+        cv2.circle(core, c, max(2, int(round(r / 2))), 1, -1)
+    sel = ink & (reach > 0)
+    n, lab = cv2.connectedComponents(sel.astype(np.uint8), connectivity=8)
+    hit = np.unique(lab[(core > 0) & sel])
+    hit = hit[hit > 0]
+    if not hit.size:
+        return None
+    sel = np.isin(lab, hit)
+    win = max(3, int(r)) | 1                          # smooth the hand-drawn path into a centreline
+    kern = np.ones(win) / win
+    padded = np.pad(pts, ((win // 2, win // 2), (0, 0)), mode="edge")
+    centre = np.column_stack([np.convolve(padded[:, i], kern, mode="valid") for i in (0, 1)])
+    return sel, centre
+
+
+class StrokeDrag:
+    """Pull or bend a selected stroke like dough. The grabbed point follows the mouse, the end
+    of the selection farthest from it stays where it is, and the part in between follows
+    smoothly, so pulling along the stroke lengthens it and pulling sideways bends it."""
+
+    def __init__(self, ink: np.ndarray, sel: np.ndarray, centre: np.ndarray, grab):
+        self.ink, self.sel = ink, sel
+        c = _resample(centre, max(1.0, float(np.hypot(*np.diff(centre, axis=0).T).sum()) / 80))
+        s = np.r_[0.0, np.cumsum(np.hypot(*np.diff(c, axis=0).T))]
+        self.c, self.s, self.L = c, s, max(float(s[-1]), 1e-6)
+        self.tg = float(_nearest_param(c, s, np.asarray(grab, np.float64).reshape(1, 2))[0])
+        self.from_start = self.tg >= self.L / 2       # anchored at the end farther from the grab
+        H, W = ink.shape
+        ys, xs = np.nonzero(sel)
+        reach = 0.45 * max(H, W)                      # the most a drag can move anything
+        x0, x1 = max(0, int(xs.min() - reach)), min(W, int(xs.max() + reach) + 1)
+        y0, y1 = max(0, int(ys.min() - reach)), min(H, int(ys.max() + reach) + 1)
+        self.box = (x0, y0, x1, y1)
+        step = 4                                      # how far along the stroke each pixel is, on a coarse grid
+        gx, gy = np.meshgrid(np.arange(x0, x1, step, dtype=np.float64), np.arange(y0, y1, step, dtype=np.float64))
+        T = _nearest_param(c, s, np.column_stack([gx.ravel(), gy.ravel()])).reshape(gx.shape)
+        self.T = cv2.resize(T, (x1 - x0, y1 - y0), interpolation=cv2.INTER_LINEAR)
+        self.X, self.Y = np.meshgrid(np.arange(x0, x1, dtype=np.float32), np.arange(y0, y1, dtype=np.float32))
+        self.sel_f = sel.astype(np.float32)
+
+    def weight(self, t):
+        if self.from_start:
+            u = np.clip(t / max(self.tg, 1e-6), 0.0, 1.0)
+        else:
+            u = np.clip((self.L - t) / max(self.L - self.tg, 1e-6), 0.0, 1.0)
+        return u * u * (3.0 - 2.0 * u)                # smooth at both ends of the bend
+
+    def apply(self, d) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """The character with the stroke dragged by d pixels: (ink, selection, centreline)."""
+        dx, dy = float(d[0]), float(d[1])
+        x0, y0, x1, y1 = self.box
+        w = self.weight(self.T)
+        xs, ys = self.X - dx * w, self.Y - dy * w
+        for _ in range(5):                            # find where each pixel came from
+            t = cv2.remap(self.T, xs - x0, ys - y0, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+            w = self.weight(t)
+            xs, ys = self.X - dx * w, self.Y - dy * w
+        moved = cv2.remap(self.sel_f, xs, ys, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT,
+                          borderValue=0) >= 0.5
+        ink = self.ink & ~self.sel
+        ink[y0:y1, x0:x1] |= moved
+        sel = np.zeros_like(self.sel)
+        sel[y0:y1, x0:x1] = moved
+        return ink, sel, self.c + np.outer(self.weight(self.s), (dx, dy))
 
 
 def fit_glyph(g: np.ndarray, gw: int, gh: int) -> np.ndarray:
@@ -742,7 +908,7 @@ def load_build(entry: dict) -> Build:
     data = json.loads((d / "build.json").read_text("utf-8"))
     b = Build(data["shape"], data["w_mm"], data["h_mm"], data["frame_mm"], data["invert_all"])
     for c in data["chars"]:
-        p = Placed(c["glyph_id"], c["name"], png_to_ink(d / "glyphs" / f"{c['glyph_id']}.png"))
+        p = Placed(c["glyph_id"], c["name"], png_to_ink(d / "glyphs" / f"{c['glyph_id']}.png"), ref_px=0.0)
         for k in PLACED_FIELDS[2:]:
             if k in c:
                 setattr(p, k, c[k])
@@ -1586,26 +1752,45 @@ class CharacterPicker(QtWidgets.QDialog):
 
 
 class ResizeHandle(QtWidgets.QGraphicsRectItem):
-    """A corner of a character's box. Drag to resize; Shift keeps the proportions."""
+    """A handle on a character's box. Corners (0-3) resize it freely, Shift keeps the
+    proportions; the handles in the middle of each side (4 top, 5 right, 6 bottom, 7 left)
+    squash or stretch it in one direction only."""
+    SHAPES = [(-5, -5, 10, 10)] * 4 + [(-7, -3.5, 14, 7), (-3.5, -7, 7, 14)] * 2
+    CURSORS = [Qt.CursorShape.SizeFDiagCursor, Qt.CursorShape.SizeBDiagCursor] * 2 + \
+              [Qt.CursorShape.SizeVerCursor, Qt.CursorShape.SizeHorCursor] * 2
 
-    def __init__(self, box, corner: int):
-        super().__init__(-5, -5, 10, 10, box)
-        self.box, self.corner = box, corner
+    def __init__(self, box, which: int):
+        super().__init__(*self.SHAPES[which], box)
+        self.box, self.corner = box, which
         self.setFlag(QtWidgets.QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations)
         self.setBrush(QtGui.QColor("#ffffff"))
         self.setPen(QtGui.QPen(QtGui.QColor(CINNABAR), 1.5))
-        self.setCursor(Qt.CursorShape.SizeFDiagCursor if corner in (0, 2) else Qt.CursorShape.SizeBDiagCursor)
+        self.setCursor(self.CURSORS[which])
         self.setZValue(10)
         self.anchor = None
 
     def mousePressEvent(self, e):
         r = self.box.scene_rect()
-        self.anchor = [r.bottomRight(), r.bottomLeft(), r.topLeft(), r.topRight()][self.corner]
+        self.r0 = QRectF(r)
+        self.anchor = [r.bottomRight(), r.bottomLeft(), r.topLeft(), r.topRight()][self.corner] \
+            if self.corner < 4 else r.center()
         self.aspect = r.width() / max(r.height(), 1e-6)
         e.accept()
 
     def mouseMoveEvent(self, e):
         if self.anchor is None:
+            return
+        if self.corner >= 4:                      # one side only: squash or stretch one way
+            r, pos = QRectF(self.r0), e.scenePos()
+            if self.corner == 4:
+                r.setTop(min(pos.y(), r.bottom() - 1))
+            elif self.corner == 5:
+                r.setRight(max(pos.x(), r.left() + 1))
+            elif self.corner == 6:
+                r.setBottom(max(pos.y(), r.top() + 1))
+            else:
+                r.setLeft(min(pos.x(), r.right() - 1))
+            self.box.set_scene_rect(r)
             return
         dx, dy = e.scenePos().x() - self.anchor.x(), e.scenePos().y() - self.anchor.y()
         w, h = max(1.0, abs(dx)), max(1.0, abs(dy))
@@ -1636,7 +1821,7 @@ class CharBox(QtWidgets.QGraphicsRectItem):
             band.setPen(QtGui.QPen(Qt.PenStyle.NoPen))
             band.setBrush(QtGui.QColor(216, 69, 47, 55))
             self.bands.append(band)
-        self.handles = [ResizeHandle(self, i) for i in range(4)]
+        self.handles = [ResizeHandle(self, i) for i in range(8)]
         self._silent = False
         self.sync()
 
@@ -1659,7 +1844,8 @@ class CharBox(QtWidgets.QGraphicsRectItem):
     def decorate(self):
         sel = self.isSelected()
         w, h = self.p.w, self.p.h
-        for handle, (x, y) in zip(self.handles, [(0, 0), (w, 0), (w, h), (0, h)]):
+        spots = [(0, 0), (w, 0), (w, h), (0, h), (w / 2, 0), (w, h / 2), (w / 2, h), (0, h / 2)]
+        for handle, (x, y) in zip(self.handles, spots):
             handle.setPos(x, y)
             handle.setVisible(sel)
         pen = QtGui.QPen(QtGui.QColor(CINNABAR if sel else C["muted"]), 1.5 if sel else 1,
@@ -1672,6 +1858,11 @@ class CharBox(QtWidgets.QGraphicsRectItem):
         self.bands[0].setVisible(sel and self.p.stretch_v > 0)
         self.bands[1].setRect(h0 * w, 0, (h1 - h0) * w, h)
         self.bands[1].setVisible(sel and self.p.stretch_h > 0)
+
+    def mouseDoubleClickEvent(self, e):
+        self.setSelected(True)
+        self.composer.edit_selected()
+        e.accept()
 
     def itemChange(self, change, value):
         GC = QtWidgets.QGraphicsItem.GraphicsItemChange
@@ -1794,6 +1985,395 @@ def mm_box(lo: float, hi: float, step: float = 0.5) -> QtWidgets.QDoubleSpinBox:
     return b
 
 
+class EditorView(QtWidgets.QGraphicsView):
+    """One character, large, in millimetres. Draw along a stroke to select it, drag the
+    selection to pull or bend it, right-click to clear it, scroll to zoom."""
+
+    def __init__(self, editor):
+        super().__init__()
+        self.editor = editor
+        self.setScene(QtWidgets.QGraphicsScene(self))
+        self.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+        self.setTransformationAnchor(QtWidgets.QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+        self.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        self.setBackgroundBrush(QtGui.QColor(C["well"]))
+        self.viewport().setCursor(Qt.CursorShape.CrossCursor)
+        self.setMinimumSize(300, 300)
+        self.pix = self.scene().addPixmap(QtGui.QPixmap())
+        self.pix.setTransformationMode(Qt.TransformationMode.SmoothTransformation)
+        self.overlay = self.scene().addPixmap(QtGui.QPixmap())
+        self.overlay.setZValue(1)
+        self.bands = []
+        for _ in range(2):
+            band = self.scene().addRect(QRectF(), QtGui.QPen(Qt.PenStyle.NoPen),
+                                        QtGui.QBrush(QtGui.QColor(216, 69, 47, 40)))
+            band.setZValue(1)
+            self.bands.append(band)
+        pen = QtGui.QPen(QtGui.QColor(CINNABAR), 2)
+        pen.setCosmetic(True)
+        self.trace = self.scene().addPath(QtGui.QPainterPath(), pen)
+        self.trace.setZValue(3)
+        pen = QtGui.QPen(QtGui.QColor(CINNABAR), 1, Qt.PenStyle.DashLine)
+        pen.setCosmetic(True)
+        self.centre = self.scene().addPath(QtGui.QPainterPath(), pen)
+        self.centre.setZValue(2)
+        self.auto_fit = True
+        self.pressed = False
+
+    def fit(self):
+        self.fitInView(self.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
+        self.auto_fit = True
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        if self.auto_fit:
+            self.fit()
+
+    def wheelEvent(self, e):
+        f = 1.15 ** (e.angleDelta().y() / 120.0)
+        vr, sr = self.viewport().rect(), self.sceneRect()
+        if self.transform().m11() * f <= min(vr.width() / sr.width(), vr.height() / sr.height()):
+            self.fit()
+            return
+        self.scale(f, f)
+        self.auto_fit = False
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MouseButton.RightButton:
+            self.editor.clear_selection()
+            return
+        if e.button() != Qt.MouseButton.LeftButton:
+            return super().mousePressEvent(e)
+        self.pressed = True
+        self.editor.press(self.mapToScene(e.position().toPoint()))
+
+    def mouseMoveEvent(self, e):
+        if self.pressed:
+            self.editor.move(self.mapToScene(e.position().toPoint()))
+        else:
+            super().mouseMoveEvent(e)
+
+    def mouseReleaseEvent(self, e):
+        if self.pressed and e.button() == Qt.MouseButton.LeftButton:
+            self.pressed = False
+            self.editor.release(self.mapToScene(e.position().toPoint()))
+        else:
+            super().mouseReleaseEvent(e)
+
+
+def _slider_row(s: QtWidgets.QSlider, label: QtWidgets.QLabel) -> QtWidgets.QHBoxLayout:
+    row = QtWidgets.QHBoxLayout()
+    row.addWidget(s, 1)
+    label.setObjectName("muted")
+    label.setMinimumWidth(label.fontMetrics().horizontalAdvance("200%") + 4)
+    label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+    row.addWidget(label)
+    return row
+
+
+class CharacterEditor(QtWidgets.QDialog):
+    """Edit one character of a build: squish it, lengthen it, change its weight, and reshape
+    single strokes by hand. Nothing in the build changes until Done."""
+
+    def __init__(self, parent, p: Placed):
+        super().__init__(parent)
+        self.setWindowTitle(f"Edit character “{p.name}”")
+        self.orig = p
+        self.h_ref, self.w_ref = p.ink.shape          # slider amounts are relative to the character itself
+        self.work = replace(p, ink=p.ink.copy(), cache=None)
+        self.pad = max(8, round(0.35 * max(p.ink.shape)))
+        resize_canvas(self.work, self.pad, self.pad, self.pad, self.pad)   # room to pull strokes into
+        self.start_ink = self.work.ink.copy()
+        rv, nv, rh, nh = stretch_rows(self.work)
+        H, W = self.work.ink.shape
+        self.sx0, self.sy0 = self.work.w / (W + nh), self.work.h / (H + nv)
+        self.sx, self.sy = self.sx0, self.sy0
+        self.sel = self.centre = None
+        self.history: list[tuple] = []
+        self.drag = self.grab_at = self.pending = None
+        self.path: list = []
+        self.reshaped = False
+        self._loading = False
+        self.timer = QtCore.QTimer(self)
+        self.timer.setSingleShot(True)
+        self.timer.setInterval(15)
+        self.timer.timeout.connect(self._preview)
+
+        outer = QtWidgets.QHBoxLayout(self)
+        outer.setSpacing(12)
+        left = QtWidgets.QVBoxLayout()
+        self.view = EditorView(self)
+        left.addWidget(self.view, 1)
+        self.hint = muted_label("Draw along a stroke, or along just the part of it you want to change, to select it.")
+        left.addWidget(self.hint)
+        outer.addLayout(left, 1)
+
+        M = self.fontMetrics().horizontalAdvance("M")
+        side, sv = side_panel(max(250, M * 19))
+        sv.addWidget(section_label("Squish"))
+        f = QtWidgets.QFormLayout()
+        f.setHorizontalSpacing(10)
+        self.sld_sq_h = slider(30, 200, "Left makes the character narrower, right makes it wider")
+        self.sld_sq_v = slider(30, 200, "Left makes the character shorter, right makes it taller")
+        self.lbl_sq_h, self.lbl_sq_v = QtWidgets.QLabel(), QtWidgets.QLabel()
+        f.addRow("Horizontal", _slider_row(self.sld_sq_h, self.lbl_sq_h))
+        f.addRow("Vertical", _slider_row(self.sld_sq_v, self.lbl_sq_v))
+        sv.addLayout(f)
+        sv.addWidget(section_label("Strokes"))
+        sv.addWidget(muted_label("1. Draw along a stroke, or along just the part you want to change.\n"
+                                 "2. Drag any point of the red selection: along the stroke to lengthen it, "
+                                 "sideways to bend it. The far end of the selection stays put.\n"
+                                 "Right-click clears the selection."))
+        row = QtWidgets.QHBoxLayout()
+        self.btn_undo = QtWidgets.QPushButton("Undo")
+        self.btn_undo.setToolTip("Undo the last change to the strokes (Ctrl+Z)")
+        self.btn_restart = QtWidgets.QPushButton("Start over")
+        self.btn_restart.setToolTip("Put every stroke back the way it was")
+        row.addWidget(self.btn_undo)
+        row.addWidget(self.btn_restart)
+        sv.addLayout(row)
+        sv.addWidget(section_label("Lengthen"))
+        sv.addWidget(muted_label("Stretches one band of the whole character, so it gets taller or wider while "
+                                 "its strokes stay as thick. Move “at” to a gap between strokes."))
+        f = QtWidgets.QFormLayout()
+        f.setHorizontalSpacing(10)
+        self.sld_v = slider(0, 100, "How much taller: the vertical strokes get longer")
+        self.sld_v_at = slider(0, 100, "Where it is stretched, from top to bottom")
+        self.sld_h = slider(0, 100, "How much wider: the horizontal strokes get longer")
+        self.sld_h_at = slider(0, 100, "Where it is stretched, from left to right")
+        f.addRow("Vertical", self.sld_v)
+        f.addRow("at", self.sld_v_at)
+        f.addRow("Horizontal", self.sld_h)
+        f.addRow("at", self.sld_h_at)
+        sv.addLayout(f)
+        sv.addWidget(section_label("Weight"))
+        self.sld_weight = slider(-5, 5, "Left for thinner strokes, right for bolder")
+        sv.addWidget(self.sld_weight)
+        self.chk_invert = QtWidgets.QCheckBox("Invert this character")
+        sv.addWidget(self.chk_invert)
+        sv.addStretch(1)
+        buttons = QtWidgets.QHBoxLayout()
+        cancel = QtWidgets.QPushButton("Cancel")
+        done = QtWidgets.QPushButton("Done")
+        done.setObjectName("primary")
+        cancel.clicked.connect(self.reject)
+        done.clicked.connect(self.accept)
+        buttons.addStretch(1)
+        buttons.addWidget(cancel)
+        buttons.addWidget(done)
+        col = QtWidgets.QVBoxLayout()
+        col.addWidget(side, 1)
+        col.addLayout(buttons)
+        outer.addLayout(col)
+
+        w = self.work
+        rv, nv, rh, nh = stretch_rows(w)
+        self._loading = True
+        self.sld_sq_h.setValue(100)
+        self.sld_sq_v.setValue(100)
+        self.sld_v.setValue(round(100 * nv / self.h_ref))
+        self.sld_h.setValue(round(100 * nh / self.w_ref))
+        self.sld_v_at.setValue(round(100 * (p.stretch_v_at if not nv else (rv - self.pad) / max(self.h_ref - 1, 1))))
+        self.sld_h_at.setValue(round(100 * (p.stretch_h_at if not nh else (rh - self.pad) / max(self.w_ref - 1, 1))))
+        self.sld_weight.setValue(w.weight)
+        self.chk_invert.setChecked(w.invert)
+        self._loading = False
+        for s in (self.sld_sq_h, self.sld_sq_v):
+            s.valueChanged.connect(self.on_squish)
+        for s in (self.sld_v, self.sld_v_at, self.sld_h, self.sld_h_at, self.sld_weight):
+            s.valueChanged.connect(self.on_params)
+        self.chk_invert.toggled.connect(self.on_params)
+        self.btn_undo.clicked.connect(self.undo)
+        self.btn_restart.clicked.connect(self.start_over)
+        undo = QtGui.QShortcut(QtGui.QKeySequence(QtGui.QKeySequence.StandardKey.Undo), self)
+        undo.activated.connect(self.undo)
+        fit_to_screen(self, 1040, 720)
+        self.on_squish()
+
+    # ---- whole-character settings
+    def update_box(self):
+        rv, nv, rh, nh = stretch_rows(self.work)
+        H, W = self.work.ink.shape
+        self.work.w, self.work.h = (W + nh) * self.sx, (H + nv) * self.sy
+
+    def on_squish(self, *_):
+        self.lbl_sq_h.setText(f"{self.sld_sq_h.value()}%")
+        self.lbl_sq_v.setText(f"{self.sld_sq_v.value()}%")
+        self.sx = self.sx0 * self.sld_sq_h.value() / 100
+        self.sy = self.sy0 * self.sld_sq_v.value() / 100
+        self.update_box()
+        self.refresh(fit=True)
+
+    def on_params(self, *_):
+        if self._loading:
+            return
+        w = self.work
+        H, W = w.ink.shape
+        nv = round(self.sld_v.value() / 100 * self.h_ref)
+        nh = round(self.sld_h.value() / 100 * self.w_ref)
+        w.stretch_v = nv / H if nv else 0.0
+        w.stretch_h = nh / W if nh else 0.0
+        w.stretch_v_at = (self.pad + self.sld_v_at.value() / 100 * (self.h_ref - 1)) / max(H - 1, 1)
+        w.stretch_h_at = (self.pad + self.sld_h_at.value() / 100 * (self.w_ref - 1)) / max(W - 1, 1)
+        w.weight = self.sld_weight.value()
+        w.invert = self.chk_invert.isChecked()
+        w.cache = None
+        self.update_box()
+        self.refresh(fit=True)
+
+    # ---- drawing
+    def to_base(self, pt) -> np.ndarray:
+        """A point of the view (mm) in the character's own pixels."""
+        rv, nv, rh, nh = stretch_rows(self.work)
+        x, y = pt.x() / self.sx, pt.y() / self.sy
+        x = x if x < rh else (rh if x < rh + nh else x - nh)
+        y = y if y < rv else (rv if y < rv + nv else y - nv)
+        return np.array([x, y], dtype=np.float64)
+
+    def to_view(self, pts: np.ndarray, w: Placed):
+        rv, nv, rh, nh = stretch_rows(w)
+        x = pts[:, 0] + np.where(pts[:, 0] > rh, nh, 0)
+        y = pts[:, 1] + np.where(pts[:, 1] > rv, nv, 0)
+        return x * self.sx, y * self.sy
+
+    def refresh(self, ink=None, sel=None, centre=None, fit=False):
+        live = ink is not None
+        w = replace(self.work, ink=ink, cache=None) if live else self.work
+        sel, centre = (sel, centre) if live else (self.sel, self.centre)
+        shaped, _ = shape_glyph(w)
+        Hs, Ws = shaped.shape
+        tf = QtGui.QTransform.fromScale(self.sx, self.sy)
+        v = self.view
+        v.pix.setPixmap(QtGui.QPixmap.fromImage(ink_to_qimage(~shaped if w.invert else shaped)))
+        v.pix.setTransform(tf)
+        if sel is not None:
+            m = stretch_array(sel, w)
+            rgba = np.zeros((Hs, Ws, 4), np.uint8)
+            rgba[m] = (216, 69, 47, 130)
+            img = QtGui.QImage(rgba.data, Ws, Hs, 4 * Ws, QtGui.QImage.Format.Format_RGBA8888).copy()
+            v.overlay.setPixmap(QtGui.QPixmap.fromImage(img))
+            v.overlay.setTransform(tf)
+        else:
+            v.overlay.setPixmap(QtGui.QPixmap())
+        path = QtGui.QPainterPath()
+        if centre is not None and len(centre) > 1:
+            xs, ys = self.to_view(centre, w)
+            path.moveTo(xs[0], ys[0])
+            for x, y in zip(xs[1:], ys[1:]):
+                path.lineTo(x, y)
+        v.centre.setPath(path)
+        rv, nv, rh, nh = stretch_rows(w)
+        v.bands[0].setRect(0, rv * self.sy, Ws * self.sx, nv * self.sy)
+        v.bands[0].setVisible(nv > 0)
+        v.bands[1].setRect(rh * self.sx, 0, nh * self.sx, Hs * self.sy)
+        v.bands[1].setVisible(nh > 0)
+        m = 0.05 * max(Ws * self.sx, Hs * self.sy)
+        v.scene().setSceneRect(QRectF(-m, -m, Ws * self.sx + 2 * m, Hs * self.sy + 2 * m))
+        if fit and v.auto_fit:
+            v.fit()
+
+    def near_selection(self, b) -> bool:
+        H, W = self.sel.shape
+        r = max(6, round(0.012 * max(H, W)))
+        x, y = int(round(b[0])), int(round(b[1]))
+        x0, x1, y0, y1 = max(0, x - r), min(W, x + r + 1), max(0, y - r), min(H, y + r + 1)
+        return x1 > x0 and y1 > y0 and bool(self.sel[y0:y1, x0:x1].any())
+
+    def press(self, pt):
+        b = self.to_base(pt)
+        if self.sel is not None and self.near_selection(b):
+            QtWidgets.QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            try:
+                self.drag = StrokeDrag(self.work.ink, self.sel, self.centre, b)
+            finally:
+                QtWidgets.QApplication.restoreOverrideCursor()
+            self.grab_at = b
+            self.hint.setText("Pull along the stroke to lengthen it, or sideways to bend it.")
+        else:
+            self.path = [b]
+            p = QtGui.QPainterPath()
+            p.moveTo(pt)
+            self.view.trace.setPath(p)
+
+    def move(self, pt):
+        if self.drag is not None:
+            self.pending = self.to_base(pt) - self.grab_at
+            self.timer.start()
+        elif self.path:
+            self.path.append(self.to_base(pt))
+            p = self.view.trace.path()
+            p.lineTo(pt)
+            self.view.trace.setPath(p)
+
+    def release(self, pt):
+        if self.drag is not None:
+            d = self.to_base(pt) - self.grab_at
+            self.timer.stop()
+            if np.hypot(*d) >= 0.5:
+                ink, sel, centre = self.drag.apply(d)
+                self.remember()
+                self.work.ink, self.sel, self.centre = ink, sel, centre
+                self.work.cache = None
+                self.reshaped = True
+            self.drag = self.grab_at = self.pending = None
+            self.hint.setText("Drag the selection again, draw along another stroke, or right-click to clear it.")
+            self.refresh()
+            return
+        path, self.path = self.path, []
+        self.view.trace.setPath(QtGui.QPainterPath())
+        found = select_stroke(self.work.ink, np.array(path)) if len(path) > 2 else None
+        if found is None:
+            self.hint.setText("No stroke found there. Draw along the middle of a stroke.")
+        else:
+            self.sel, self.centre = found
+            self.hint.setText("Now drag any point of the red stroke. Right-click to clear the selection.")
+        self.refresh()
+
+    def _preview(self):
+        if self.drag is not None and self.pending is not None:
+            self.refresh(*self.drag.apply(self.pending))
+
+    def clear_selection(self):
+        self.sel = self.centre = None
+        self.hint.setText("Draw along a stroke, or along just the part of it you want to change, to select it.")
+        self.refresh()
+
+    def remember(self):
+        self.history.append((self.work.ink.copy(), None if self.sel is None else self.sel.copy(),
+                             None if self.centre is None else self.centre.copy()))
+
+    def undo(self):
+        if not self.history:
+            return
+        self.work.ink, self.sel, self.centre = self.history.pop()
+        self.work.cache = None
+        self.reshaped = bool(self.history) or self.reshaped
+        self.refresh()
+
+    def start_over(self):
+        self.remember()
+        self.work.ink = self.start_ink.copy()
+        self.work.cache = None
+        self.clear_selection()
+
+    def accept(self):
+        w = self.work
+        ys, xs = np.nonzero(w.ink)
+        if xs.size:                                   # trim the room added for editing
+            H, W = w.ink.shape
+            m = max(2, round(0.03 * max(int(np.ptp(ys)), int(np.ptp(xs)))))
+            resize_canvas(w, -(int(ys.min()) - m), -(H - 1 - int(ys.max()) - m),
+                          -(int(xs.min()) - m), -(W - 1 - int(xs.max()) - m))
+        p = self.orig
+        for k in ("ink", "w", "h", "cx", "cy", "weight", "stretch_v", "stretch_v_at", "stretch_h", "stretch_h_at",
+                  "invert", "ref_px"):
+            setattr(p, k, getattr(w, k))
+        if self.reshaped:                             # its strokes differ now: keep it as its own drawing
+            p.glyph_id = f"{p.glyph_id.split('~')[0]}~{new_id()}"
+        p.cache = None
+        super().accept()
+
+
 class Composer(QtWidgets.QWidget):
     """Build a seal out of saved characters."""
     saved = QtCore.Signal(dict, bool)          # library entry, and whether to add it to the sheet
@@ -1890,28 +2470,13 @@ class Composer(QtWidgets.QWidget):
         f.addRow("Width", self.spn_cw)
         f.addRow("Height", self.spn_ch)
         rv.addLayout(f)
-        rv.addWidget(QtWidgets.QLabel("Lengthen strokes"))
-        rv.addWidget(muted_label("Stretches one band of the character, so it gets taller or wider while "
-                                 "its strokes stay as thick. Move “at” to a gap between strokes."))
-        f = QtWidgets.QFormLayout()
-        f.setHorizontalSpacing(10)
-        self.sld_v = slider(0, 100, "How much longer the vertical strokes get")
-        self.sld_v_at = slider(0, 100, "Where the character is stretched, from top to bottom")
-        self.sld_h = slider(0, 100, "How much longer the horizontal strokes get")
-        self.sld_h_at = slider(0, 100, "Where the character is stretched, from left to right")
-        f.addRow("Vertical", self.sld_v)
-        f.addRow("at", self.sld_v_at)
-        f.addRow("Horizontal", self.sld_h)
-        f.addRow("at", self.sld_h_at)
-        rv.addLayout(f)
-        rv.addWidget(QtWidgets.QLabel("Stroke weight"))
-        self.sld_weight = slider(-5, 5, "Left for thinner strokes, right for bolder")
-        rv.addWidget(self.sld_weight)
-        self.chk_invert = QtWidgets.QCheckBox("Invert this character")
-        rv.addWidget(self.chk_invert)
+        self.btn_edit_char = QtWidgets.QPushButton("Edit character…")
+        self.btn_edit_char.setToolTip("Squish it, lengthen it, change its weight, or reshape single strokes")
+        rv.addWidget(self.btn_edit_char)
+        rv.addWidget(muted_label("Double-click a character to edit it. On the seal, the handles in the middle "
+                                 "of each side squash or stretch it in one direction."))
         rv.addStretch(1)
-        self.char_controls = (self.spn_cw, self.spn_ch, self.sld_v, self.sld_v_at, self.sld_h, self.sld_h_at,
-                              self.sld_weight, self.chk_invert, self.btn_remove)
+        self.char_controls = (self.spn_cw, self.spn_ch, self.btn_edit_char, self.btn_remove)
 
         body = QtWidgets.QHBoxLayout()
         body.setSpacing(14)
@@ -1956,9 +2521,7 @@ class Composer(QtWidgets.QWidget):
         self.view.scene().selectionChanged.connect(self.on_select)
         for w in (self.spn_cw, self.spn_ch):
             w.valueChanged.connect(self.on_char_edit)
-        for w in (self.sld_v, self.sld_v_at, self.sld_h, self.sld_h_at, self.sld_weight):
-            w.valueChanged.connect(self.on_char_edit)
-        self.chk_invert.toggled.connect(self.on_char_edit)
+        self.btn_edit_char.clicked.connect(self.edit_selected)
         self.btn_save.clicked.connect(lambda: self.save(False))
         self.btn_save_add.clicked.connect(lambda: self.save(True))
         cancel.clicked.connect(self.cancelled.emit)
@@ -2119,12 +2682,6 @@ class Composer(QtWidgets.QWidget):
         self._loading = True
         self.spn_cw.setValue(p.w)
         self.spn_ch.setValue(p.h)
-        self.sld_v.setValue(round(p.stretch_v * 100))
-        self.sld_v_at.setValue(round(p.stretch_v_at * 100))
-        self.sld_h.setValue(round(p.stretch_h * 100))
-        self.sld_h_at.setValue(round(p.stretch_h_at * 100))
-        self.sld_weight.setValue(p.weight)
-        self.chk_invert.setChecked(p.invert)
         self._loading = False
 
     def on_char_edit(self, *_):
@@ -2135,21 +2692,18 @@ class Composer(QtWidgets.QWidget):
         if (p.w, p.h) != (self.spn_cw.value(), self.spn_ch.value()):
             p.w, p.h = self.spn_cw.value(), self.spn_ch.value()
             self.auto_layout = False
-        sv, sh = self.sld_v.value() / 100, self.sld_h.value() / 100
-        if sv != p.stretch_v or sh != p.stretch_h:        # the character grows by what is added,
-            p.h *= (1 + sv) / (1 + p.stretch_v)           # so the rest of it keeps its scale
-            p.w *= (1 + sh) / (1 + p.stretch_h)
-            self.auto_layout = False
-            self._loading = True
-            self.spn_cw.setValue(p.w)
-            self.spn_ch.setValue(p.h)
-            self._loading = False
-        p.stretch_v, p.stretch_v_at = sv, self.sld_v_at.value() / 100
-        p.stretch_h, p.stretch_h_at = sh, self.sld_h_at.value() / 100
-        p.weight = self.sld_weight.value()
-        p.invert = self.chk_invert.isChecked()
         box.sync()
         self.schedule()
+
+    def edit_selected(self):
+        box = self.selected()
+        if box is None:
+            return
+        if CharacterEditor(self, box.p).exec() == QtWidgets.QDialog.DialogCode.Accepted:
+            self.auto_layout = False
+            box.sync()
+            self._fill_char_controls(box.p)
+            self.schedule()
 
     def remove_selected(self):
         box = self.selected()

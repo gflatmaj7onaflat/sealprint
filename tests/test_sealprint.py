@@ -174,3 +174,46 @@ def test_characters_and_builds_round_trip(tmp_path, monkeypatch):
     assert again.chars[0].invert and again.chars[0].stretch_v == 0.2
     job = sp.job_from_library(seal)
     assert job.lib_id == sid and job.dims() == pytest.approx((18, 24), abs=0.05)
+
+
+# ───────────────────────────── single strokes
+
+def plus_padded():
+    """A plus sign with room around it: bar rows 170-189, x 80-279; vertical stroke x 170-189."""
+    return np.pad(glyph_cross(200, 20), 80)
+
+
+@pytest.mark.parametrize("off", [0, 7, -8])
+def test_drawing_along_part_of_a_stroke_selects_just_that_part(off):
+    g = plus_padded()
+    path = np.column_stack([np.linspace(205, 276, 40), np.full(40, 180.0 + off)])   # even along an edge
+    sel, centre = sp.select_stroke(g, path)
+    assert sel[:, 250].sum() == 20                       # the whole width of the bar there
+    assert not sel[180, 120] and not sel[100, 180]       # not the other half, not the other stroke
+    assert abs(np.median(centre[:, 1]) - 179.5) < 1.5    # centreline in the middle of the bar
+
+
+def test_pulling_a_stroke_lengthens_it_without_thickening():
+    g = plus_padded()
+    sel, centre = sp.select_stroke(g, np.column_stack([np.linspace(205, 276, 40), np.full(40, 180.0)]))
+    drag = sp.StrokeDrag(g, sel, centre, (275, 180))
+    ink, _, _ = drag.apply((40, 0))
+    assert np.nonzero(ink[180])[0].max() == 319          # was 279
+    assert ink[:, 300].sum() == 20                       # same thickness as before
+    assert (ink[:, :170] == g[:, :170]).all()            # the rest of the character is untouched
+    bent, _, _ = drag.apply((0, 50))
+    rows = np.nonzero(bent[:, 272])[0]
+    assert rows.min() >= 215 and rows.max() <= 245       # the end moved down about 50
+    assert (bent[:, 160:200] == g[:, 160:200]).all()     # the junction and the other stroke stay put
+
+
+def test_resizing_a_characters_canvas_keeps_it_in_place():
+    b = sp.Build("rect", 20, 20, 1.0)
+    p = sp.Placed("g", "十", glyph_cross(), stretch_v=0.3, stretch_v_at=0.3)
+    b.chars = [p]
+    sp.auto_arrange(b)
+    before = sp.render_build(b, 20)
+    sp.resize_canvas(p, 30, 10, 25, 5)
+    assert (before != sp.render_build(b, 20)).sum() <= 4
+    sp.resize_canvas(p, -30, -10, -25, -5)
+    assert (before == sp.render_build(b, 20)).all()
