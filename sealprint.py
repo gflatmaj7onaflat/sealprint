@@ -29,7 +29,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import QPointF, QRectF, Qt
 
 APP_NAME = "Seal Print"
-__version__ = "1.4.0"
+__version__ = "1.5.0"
 A4_W, A4_H = 210.0, 297.0           # page size, mm
 PAGE_MARGIN = 10.0                  # mm kept clear at the paper edge
 EXPORT_DPI = 1200                   # resolution of the seal image inside the PDF
@@ -307,6 +307,126 @@ def export_px(size_mm: float) -> int:
 
 
 
+def _bspline_matrix(u: np.ndarray, knots: np.ndarray, k: int = 3) -> np.ndarray:
+    """Basis of a B-spline of degree k on `knots`, evaluated at parameters u (Cox-de Boor)."""
+    t = knots
+    B = ((t[:-1] <= u[:, None]) & (u[:, None] < t[1:])).astype(np.float64)
+    last = np.nonzero(t[:-1] < t[1:])[0][-1]          # the end of the range belongs to the last span
+    B[u >= t[-1], last] = 1.0
+    for d in range(1, k + 1):
+        n = len(t) - d - 1
+        den1 = t[d:d + n] - t[:n]
+        den2 = t[d + 1:d + 1 + n] - t[1:n + 1]
+        a = np.where(den1 > 0, (u[:, None] - t[:n]) / np.where(den1 > 0, den1, 1), 0.0)
+        b = np.where(den2 > 0, (t[d + 1:d + 1 + n] - u[:, None]) / np.where(den2 > 0, den2, 1), 0.0)
+        B = a * B[:, :n] + b * B[:, 1:n + 1]
+    return B
+
+
+def _fit_open(pts: np.ndarray, spacing: float) -> np.ndarray:
+    """Least-squares cubic B-spline through an open run of outline points, ends kept in place."""
+    n = len(pts)
+    m = max(1, int(round((n - 1) / spacing)))          # spans
+    if n < 8 or m < 2:
+        return pts
+    knots = np.r_[[0.0] * 3, np.linspace(0, 1, m + 1), [1.0] * 3]
+    u = np.linspace(0, 1, n)
+    A = _bspline_matrix(u, knots)
+    w = np.ones(n)
+    w[[0, -1]] = 1e3                                  # pin the corners
+    P, *_ = np.linalg.lstsq(A * w[:, None], pts * w[:, None], rcond=None)
+    return A @ P
+
+
+def _fit_closed(pts: np.ndarray, spacing: float) -> np.ndarray:
+    """Least-squares periodic cubic B-spline through a closed outline without corners."""
+    n = len(pts)
+    K = max(4, int(round(n / spacing)))
+    if n < 12:
+        return pts
+    u = np.arange(n) * K / n
+    j = np.floor(u).astype(int)
+    t = u - j
+    W = np.column_stack([(1 - t) ** 3, 3 * t ** 3 - 6 * t ** 2 + 4, -3 * t ** 3 + 3 * t ** 2 + 3 * t + 1, t ** 3]) / 6
+    A = np.zeros((n, K))
+    for c in range(4):
+        np.add.at(A, (np.arange(n), (j - 1 + c) % K), W[:, c])
+    P, *_ = np.linalg.lstsq(A, pts, rcond=None)
+    return A @ P
+
+
+def _turning(pts: np.ndarray, reach: int) -> np.ndarray:
+    a = pts - np.roll(pts, reach, axis=0)
+    b = np.roll(pts, -reach, axis=0) - pts
+    return np.abs(np.arctan2(a[:, 0] * b[:, 1] - a[:, 1] * b[:, 0], (a * b).sum(1)))
+
+
+def _outline_corners(pts: np.ndarray, reach: int, min_turn: float) -> list:
+    """Indices of real corners on a closed outline. Turning is measured on a lightly smoothed
+    copy and at two distances: a real corner turns sharply both close up and from further
+    away, while pixel stair-steps and ragged edges only turn close up."""
+    n = len(pts)
+    sigma = max(1.0, reach / 2)
+    k = np.exp(-0.5 * (np.arange(-3 * int(sigma), 3 * int(sigma) + 1) / sigma) ** 2)
+    k /= k.sum()
+    h = len(k) // 2
+    wrap = np.vstack([pts[-h:], pts, pts[:h]]) if h else pts
+    soft = np.column_stack([np.convolve(wrap[:, i], k, mode="valid") for i in (0, 1)])[:n]
+    turn = np.minimum(_turning(soft, reach), _turning(soft, min(2 * reach, max(1, n // 4))))
+    peak = turn.copy()                                # the sharpest point within reach on each side
+    for j in range(1, reach + 1):
+        peak = np.maximum(peak, np.maximum(np.roll(turn, j), np.roll(turn, -j)))
+    cand = np.nonzero((turn >= min_turn) & (turn >= peak))[0]
+    corners = []
+    for i in cand:                                    # one corner per plateau
+        if not corners or i - corners[-1] > reach:
+            corners.append(int(i))
+    if len(corners) > 1 and corners[0] + n - corners[-1] <= reach:
+        corners.pop()
+    return corners
+
+
+def smooth_strokes(ink: np.ndarray, strength: float = 1.0) -> np.ndarray:
+    """Redraw the outline of every stroke as clean curves: a best guess at the stroke the ink
+    was meant to be. Specks and pinholes go, edges are traced, real corners are found and kept
+    sharp, and the runs between them are refitted with smooth curves, so straight edges come
+    out straight, curves even, and stair-steps, nicks and bumps disappear."""
+    H, W = ink.shape
+    dt = cv2.distanceTransform(ink.astype(np.uint8), cv2.DIST_L2, 3)
+    stroke = 2 * float(np.percentile(dt[dt > 0], 75)) / 0.75 if (dt > 0).any() else 0.0   # typical stroke width
+    size = max(H, W)
+    spacing = max(5.0, min(0.03 * size, max(0.012 * size, 0.8 * stroke)) * strength)   # finer detail is smoothed away
+    reach = max(3, int(round(spacing * 0.4)))
+    small = (0.8 * spacing) ** 2                      # specks of ink and pinholes in strokes
+    n, lab, st, _ = cv2.connectedComponentsWithStats(ink.astype(np.uint8), connectivity=8)
+    ink = (st[:, cv2.CC_STAT_AREA] >= small)[lab] & ink
+    n, lab, st, _ = cv2.connectedComponentsWithStats((~ink).astype(np.uint8), connectivity=4)
+    x, y, w, h, area = st.T
+    pin = (area < small) & (x > 0) & (y > 0) & (x + w < W) & (y + h < H)
+    pin[0] = False
+    ink = ink | pin[lab]
+    contours, _ = cv2.findContours(ink.astype(np.uint8), cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
+    out, polys = np.zeros((H, W), np.uint8), []
+    for c in contours:
+        pts = c[:, 0, :].astype(np.float64)
+        if len(pts) < 4 * reach:
+            polys.append(pts)                          # specks and tiny dots stay as they are
+            continue
+        pts = _resample(np.vstack([pts, pts[:1]]), 1.0)[:-1]
+        corners = _outline_corners(pts, reach, math.radians(45))
+        if not corners:
+            smooth = _fit_closed(pts, spacing)
+        else:
+            pieces = []
+            for a, b in zip(corners, corners[1:] + [corners[0] + len(pts)]):
+                run = pts[np.arange(a, b + 1) % len(pts)]
+                pieces.append(_fit_open(run, spacing)[:-1])
+            smooth = np.vstack(pieces)
+        polys.append(smooth)
+    cv2.fillPoly(out, [np.round(p * 16).astype(np.int32).reshape(-1, 1, 2) for p in polys], 1, cv2.LINE_8, 4)
+    return out > 0
+
+
 # ───────────────────────────────────────────────────────────────── one seal
 
 @dataclass(eq=False)
@@ -328,10 +448,34 @@ class SealJob:
     square: bool = True                # False keeps the frame's proportions: rectangle, oval, circle…
     ratio: float = 1.0                 # short / long side of the frame as detected
     lib_id: str | None = None          # folder name in the seal library, once saved
+    extra_smooth: bool = False         # redraw the outlines as clean curves
+    crop: list | None = None           # [x0, y0, x1, y1] drawn by hand, in source pixels
+    use_crop: bool = False             # use that crop instead of the automatic frame
+    auto_corners: np.ndarray | None = None   # the automatic frame (or the whole image)
+    auto_manual: bool = False          # the automatic frame was chosen by hand (whole image)
     maps: dict = field(default_factory=dict)
     cache: tuple | None = None
     preview: QtGui.QImage | None = None
     preview_key: tuple | None = None
+
+    def __post_init__(self):
+        if self.auto_corners is None and self.corners is not None:
+            self.auto_corners = np.asarray(self.corners, dtype=float).copy()
+            self.auto_manual = self.frame_manual
+
+    def apply_crop(self):
+        """Use the hand-drawn crop as the frame while it is switched on, else the automatic one."""
+        if self.use_crop and self.crop is not None:
+            x0, y0, x1, y1 = self.crop
+            self.corners = np.array([[x0, y0], [x1, y0], [x1, y1], [x0, y1]], dtype=float)
+            self.frame_manual = True
+        elif self.auto_corners is not None:
+            self.corners = self.auto_corners.copy()
+            self.frame_manual = self.auto_manual
+
+    def bw(self, warped, pps, mirror: bool) -> np.ndarray:
+        ink = to_black_white(warped, 255 - self.weight, self.smooth * 0.2, pps, self.invert, mirror)
+        return smooth_strokes(ink) if self.extra_smooth else ink
 
     def ink(self) -> np.ndarray:
         if self.mode not in self.maps:
@@ -340,7 +484,8 @@ class SealJob:
 
     def detect(self):
         self.corners, self.mode, self.found, self.ratio = detect_frame(self.rgb, self.ink_choice, self.square)
-        self.frame_manual = False
+        self.auto_corners = self.corners.copy()
+        self.frame_manual = self.auto_manual = self.use_crop = False
         self.auto_t = True
 
     def frame_px(self) -> tuple[float, float]:
@@ -380,10 +525,10 @@ class SealJob:
         key, warped, pps, t_auto = self._warped_preview()
         if self.auto_t:
             self.weight = int(round(255 - t_auto))
-        pkey = (key, self.weight, self.smooth, self.invert, mirror)
+        pkey = (key, self.weight, self.smooth, self.invert, mirror, self.extra_smooth)
         if pkey == self.preview_key:
             return False
-        ink = to_black_white(warped, 255 - self.weight, self.smooth * 0.2, pps, self.invert, mirror)
+        ink = self.bw(warped, pps, mirror)
         self.preview, self.preview_key = ink_to_qimage(ink), pkey
         return True
 
@@ -394,17 +539,19 @@ class SealJob:
         if self.auto_t:
             self.weight = int(round(255 - self._warped_preview()[3]))
         warped, pps = warp_ink(self.ink(), self.corners, *self.out_px(export_px(max(self.dims()) * scale)))
-        return to_black_white(warped, 255 - self.weight, self.smooth * 0.2, pps, self.invert, mirror)
+        return self.bw(warped, pps, mirror)
 
     def render_long(self, long_px: int) -> np.ndarray:
         """Black/white seal with its long side long_px pixels (True = black), never mirrored."""
         if self.auto_t:
             self.weight = int(round(255 - self._warped_preview()[3]))
         warped, pps = warp_ink(self.ink(), self.corners, *self.out_px(long_px))
-        return to_black_white(warped, 255 - self.weight, self.smooth * 0.2, pps, self.invert, False)
+        return self.bw(warped, pps, False)
 
     def duplicate(self) -> SealJob:
-        return replace(self, corners=self.corners.copy(), lib_id=None)   # shares image and ink maps
+        return replace(self, corners=self.corners.copy(), lib_id=None,   # shares image and ink maps
+                       auto_corners=None if self.auto_corners is None else self.auto_corners.copy(),
+                       crop=None if self.crop is None else list(self.crop))
 
 
 # ───────────────────────────────────────────────────────────────── seal library
@@ -413,7 +560,7 @@ class SealJob:
 LIBRARY = Path(QtCore.QStandardPaths.writableLocation(
     QtCore.QStandardPaths.StandardLocation.GenericDataLocation)) / "sealprint" / "library"
 SAVED_FIELDS = ("size", "copies", "smooth", "ink_choice", "invert", "mode", "found", "frame_manual",
-                "auto_t", "weight", "square", "ratio")
+                "auto_t", "weight", "square", "ratio", "extra_smooth", "use_crop", "auto_manual")
 
 
 def library_entries() -> list[dict]:
@@ -441,7 +588,9 @@ def save_to_library(job: SealJob, name: str) -> str:
     d.mkdir(parents=True, exist_ok=True)
     # Keep the frame plus generous room around it, so it can still be adjusted later.
     c = np.asarray(job.corners, dtype=float)
-    (x0, y0), (x1, y1) = c.min(axis=0), c.max(axis=0)
+    both = [c] + ([np.asarray(job.auto_corners, dtype=float)] if job.auto_corners is not None else []) \
+        + ([np.asarray(job.crop, dtype=float).reshape(2, 2)] if job.crop is not None else [])
+    (x0, y0), (x1, y1) = np.vstack(both).min(axis=0), np.vstack(both).max(axis=0)
     H, W = job.rgb.shape[:2]
     mx, my = 0.25 * (x1 - x0), 0.25 * (y1 - y0)
     X0, Y0 = max(0, int(math.floor(x0 - mx))), max(0, int(math.floor(y0 - my)))
@@ -454,6 +603,10 @@ def save_to_library(job: SealJob, name: str) -> str:
     (d / "image.png").write_bytes(png.tobytes())
     meta = {"version": 1, "name": name, "saved": time.strftime("%Y-%m-%d %H:%M:%S"),
             "corners": (c - [X0, Y0]).tolist(), **{k: getattr(job, k) for k in SAVED_FIELDS}}
+    if job.auto_corners is not None:
+        meta["auto_corners"] = (np.asarray(job.auto_corners, dtype=float) - [X0, Y0]).tolist()
+    if job.crop is not None:
+        meta["crop"] = [float(v) for v in np.asarray(job.crop, dtype=float) - [X0, Y0, X0, Y0]]
     (d / "seal.json").write_text(json.dumps(meta, ensure_ascii=False, indent=1), "utf-8")
     if job.preview is not None:
         job.preview.scaled(192, 192, Qt.AspectRatioMode.KeepAspectRatio,
@@ -468,6 +621,10 @@ def job_from_library(entry: dict) -> SealJob:
     for k in SAVED_FIELDS:
         if k in entry:
             setattr(job, k, entry[k])
+    job.auto_corners = np.array(entry.get("auto_corners", entry["corners"]), dtype=float)
+    if "auto_manual" not in entry:
+        job.auto_manual = job.frame_manual
+    job.crop = entry.get("crop")
     return job
 
 
@@ -588,14 +745,31 @@ class Placed:
     use_strokes: bool = True
     use_lengthen: bool = True
     use_erase: bool = True
+    use_move: bool = True
     invert: bool = False
     z: float = 0.0                   # stacking: higher is on top where characters overlap
     cache: tuple | None = None
 
 
 PLACED_FIELDS = ("glyph_id", "name", "cx", "cy", "scale", "sq_x", "sq_y", "use_squish", "crop", "use_crop",
-                 "weight", "use_weight", "ops", "use_strokes", "use_lengthen", "use_erase", "invert", "z")
-OP_SWITCH = {"drag": "use_strokes", "lengthen": "use_lengthen", "erase": "use_erase"}
+                 "weight", "use_weight", "ops", "use_strokes", "use_lengthen", "use_erase", "use_move", "invert", "z")
+OP_SWITCH = {"drag": "use_strokes", "lengthen": "use_lengthen", "erase": "use_erase", "move": "use_move"}
+
+
+def lasso_mask(shape, poly, offset: float = 0.0) -> np.ndarray:
+    m = np.zeros(shape, np.uint8)
+    pts = np.round((np.asarray(poly, np.float64).reshape(-1, 2) + offset) * 16).astype(np.int32)
+    cv2.fillPoly(m, [pts.reshape(-1, 1, 2)], 1, cv2.LINE_8, 4)
+    return m > 0
+
+
+def move_part(g: np.ndarray, mask: np.ndarray, d) -> np.ndarray:
+    """Lift the ink inside a mask and put it down again d pixels away."""
+    part = (g & mask).astype(np.float32)
+    shift = np.float32([[1, 0, d[0]], [0, 1, d[1]]])
+    moved = cv2.warpAffine(part, shift, (g.shape[1], g.shape[0]), flags=cv2.INTER_LINEAR,
+                           borderMode=cv2.BORDER_CONSTANT, borderValue=0) >= 0.5
+    return (g & ~mask) | moved
 
 
 @dataclass(eq=False)
@@ -616,15 +790,23 @@ def edit_pad(p: Placed) -> int:
     return max(8, round(EDIT_PAD * max(p.src.shape)))
 
 
-def thicken(g: np.ndarray, weight: int, ref: float) -> np.ndarray:
-    """Bolder (weight > 0) or thinner strokes; ref is the character's own size in pixels."""
+WEIGHT_STEP = 0.0005                 # each step of weight moves every edge by 0.05% of the character's size
+
+
+def thicken(g: np.ndarray, weight: float, ref: float, soft: bool = False) -> np.ndarray:
+    """Bolder (weight > 0) or thinner strokes: every edge moves out or in by the same distance,
+    measured exactly, so even a fraction of a pixel counts. ref is the character's own size in
+    pixels. soft=True gives coverage (0..1) that keeps that fraction for scaling."""
     if not weight:
-        return g
-    r = max(1, round(abs(weight) * ref * 0.005))
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))
-    g8 = np.pad(g.astype(np.uint8), r)
-    g8 = cv2.dilate(g8, kernel) if weight > 0 else cv2.erode(g8, kernel)
-    return g8[r:-r, r:-r] > 0
+        return g.astype(np.float32) if soft else g
+    r = weight * ref * WEIGHT_STEP
+    pad = int(math.ceil(abs(r))) + 2
+    g8 = np.pad(g.astype(np.uint8), pad)
+    inside = cv2.distanceTransform(g8, cv2.DIST_L2, 5)
+    outside = cv2.distanceTransform(1 - g8, cv2.DIST_L2, 5)
+    edge = np.where(g8 > 0, 0.5 - inside, outside - 0.5)     # signed distance to the edge, + outside
+    cov = np.clip(0.5 + r - edge, 0.0, 1.0)[pad:-pad, pad:-pad].astype(np.float32)
+    return cov if soft else cov >= 0.5
 
 
 def active_ops(p: Placed) -> list:
@@ -647,6 +829,8 @@ def apply_op(g: np.ndarray, op: dict, pad: int) -> tuple[np.ndarray, np.ndarray 
     """Replay one stroke edit on a padded canvas: (canvas, the stroke afterwards, its centreline)."""
     if op["kind"] == "erase":
         return g & ~erase_mask(g.shape, op["points"], op["radius"], pad), None, None
+    if op["kind"] == "move":
+        return move_part(g, lasso_mask(g.shape, op["poly"], pad), op["d"]), None, None
     found = select_stroke(g, np.asarray(op["path"], np.float64) + pad)
     if found is None:
         return g, None, None
@@ -678,12 +862,12 @@ def process_char(p: Placed) -> tuple[np.ndarray, int, int]:
     pad = edit_pad(p) if ops else 0
     g = edit_canvas(p, ops) if ops else p.src
     if p.use_weight and p.weight:
-        g = thicken(g, p.weight, max(p.src.shape))
+        g = thicken(g, p.weight, max(p.src.shape), soft=True)    # edges kept to a fraction of a pixel
     if crop is not None:
         x0, y0, x1, y1 = (int(round(v)) + pad for v in crop)
-        keep = np.zeros_like(g)
+        keep = np.zeros(g.shape, bool)
         keep[max(0, y0):max(0, y1), max(0, x0):max(0, x1)] = True
-        g = g & keep
+        g = g * keep if g.dtype != bool else g & keep
     ys, xs = np.nonzero(g)
     if xs.size:
         img = g[ys.min():ys.max() + 1, xs.min():xs.max() + 1]
@@ -1132,7 +1316,7 @@ def save_build(b: Build, name: str, lib_id: str | None = None) -> str:
     job.update_preview(False)
     save_to_library(job, name)
     d = LIBRARY / job.lib_id
-    layout = {"version": 2, "shape": b.shape, "w_mm": b.w_mm, "h_mm": b.h_mm, "frame_mm": b.frame_mm,
+    layout = {"version": 3, "shape": b.shape, "w_mm": b.w_mm, "h_mm": b.h_mm, "frame_mm": b.frame_mm,
               "invert_all": b.invert_all, "corner_mm": b.corner_mm,
               "chars": [{k: getattr(p, k) for k in PLACED_FIELDS} for p in b.chars]}
     (d / "build.json").write_text(json.dumps(layout, ensure_ascii=False, indent=1), "utf-8")
@@ -1158,7 +1342,7 @@ def _from_v1(c: dict, g: np.ndarray) -> Placed:
     H, W = g.shape
     scale = c["w"] / W
     return Placed(c["glyph_id"], c["name"], g, cx=c["cx"], cy=c["cy"], scale=scale, sq_x=1.0,
-                  sq_y=(c["h"] / H) / scale, weight=int(c.get("weight", 0)), invert=bool(c.get("invert", False)))
+                  sq_y=(c["h"] / H) / scale, weight=10 * int(c.get("weight", 0)), invert=bool(c.get("invert", False)))
 
 
 def load_build(entry: dict) -> Build:
@@ -1175,6 +1359,8 @@ def load_build(entry: dict) -> Build:
         for k in PLACED_FIELDS[2:]:
             if k in c:
                 setattr(p, k, c[k])
+        if data.get("version", 1) < 3:
+            p.weight *= 10
         b.chars.append(p)
     return b
 
@@ -1306,37 +1492,101 @@ def make_logo(size: int, dpr: float = 2.0) -> QtGui.QPixmap:
     return pm
 
 
-class Handle(QtWidgets.QGraphicsEllipseItem):
-    R = 7.0
+class CropHandle(QtWidgets.QGraphicsRectItem):
+    """A handle of the main page's crop box: 0-3 corners, 4-7 the middles of the sides."""
+    SHAPES = [(-5, -5, 10, 10)] * 4 + [(-7, -3.5, 14, 7), (-3.5, -7, 7, 14)] * 2
+    CURSORS = [Qt.CursorShape.SizeFDiagCursor, Qt.CursorShape.SizeBDiagCursor] * 2 + \
+              [Qt.CursorShape.SizeVerCursor, Qt.CursorShape.SizeHorCursor] * 2
 
-    def __init__(self, on_move):
-        super().__init__(-self.R, -self.R, 2 * self.R, 2 * self.R)
-        self._on_move = on_move
-        F = QtWidgets.QGraphicsItem.GraphicsItemFlag
-        self.setFlags(F.ItemIsMovable | F.ItemSendsGeometryChanges | F.ItemIgnoresTransformations)
+    def __init__(self, box, which: int):
+        super().__init__(*self.SHAPES[which], box)
+        self.box, self.which = box, which
+        self.setFlag(QtWidgets.QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations)
         self.setBrush(QtGui.QColor("#ffffff"))
-        self.setPen(QtGui.QPen(QtGui.QColor(CINNABAR), 2.5))
-        self.setCursor(Qt.CursorShape.SizeAllCursor)
-        self.setAcceptHoverEvents(True)
+        self.setPen(QtGui.QPen(QtGui.QColor(CINNABAR), 1.5))
+        self.setCursor(self.CURSORS[which])
         self.setZValue(10)
+        self.start = None
 
-    def hoverEnterEvent(self, e):
-        self.setScale(1.3)
-        super().hoverEnterEvent(e)
+    def mousePressEvent(self, e):
+        self.start = self.box.scene_rect()
+        e.accept()
 
-    def hoverLeaveEvent(self, e):
-        self.setScale(1.0)
-        super().hoverLeaveEvent(e)
+    def mouseMoveEvent(self, e):
+        if self.start is not None:
+            self.box.drag_handle(self.which, e.scenePos(), self.start)
+
+    def mouseReleaseEvent(self, e):
+        self.start = None
+
+
+class CropBox(QtWidgets.QGraphicsRectItem):
+    """The hand-drawn crop of a seal on the main page: drag it to move it, its corners and
+    sides to resize it. A square seal's crop stays square."""
+
+    def __init__(self, editor):
+        super().__init__()
+        self.editor = editor
+        F = QtWidgets.QGraphicsItem.GraphicsItemFlag
+        self.setFlags(F.ItemIsMovable | F.ItemSendsGeometryChanges)
+        pen = QtGui.QPen(QtGui.QColor(CINNABAR), 1.6, Qt.PenStyle.DashLine)
+        pen.setCosmetic(True)
+        self.setPen(pen)
+        self.setBrush(QtGui.QBrush(Qt.GlobalColor.transparent))
+        self.setCursor(Qt.CursorShape.SizeAllCursor)
+        self.setZValue(5)
+        self.handles = [CropHandle(self, i) for i in range(8)]
+        self.square = True
+        self._silent = False
+
+    def scene_rect(self) -> QRectF:
+        return QRectF(self.pos(), self.rect().size())
+
+    def place(self, r: QRectF, square: bool):
+        self.square = square
+        self._silent = True
+        self.setPos(r.topLeft())
+        self.setRect(0, 0, r.width(), r.height())
+        self._silent = False
+        w, h = r.width(), r.height()
+        spots = [(0, 0), (w, 0), (w, h), (0, h), (w / 2, 0), (w, h / 2), (w / 2, h), (0, h / 2)]
+        for i, (handle, (x, y)) in enumerate(zip(self.handles, spots)):
+            handle.setPos(x, y)
+            handle.setVisible(i < 4 or not square)
+
+    def drag_handle(self, which: int, pos: QPointF, r0: QRectF):
+        bounds = self.editor.image_rect
+        if which < 4:                                 # a corner: the opposite one stays put
+            anchor = [r0.bottomRight(), r0.bottomLeft(), r0.topLeft(), r0.topRight()][which]
+            dx, dy = pos.x() - anchor.x(), pos.y() - anchor.y()
+            if self.square:
+                w = h = max(4.0, max(abs(dx), abs(dy)))
+            else:
+                w, h = max(4.0, abs(dx)), max(4.0, abs(dy))
+            r = QRectF(anchor.x() if dx >= 0 else anchor.x() - w, anchor.y() if dy >= 0 else anchor.y() - h, w, h)
+        else:
+            r = QRectF(r0)
+            if which == 4:
+                r.setTop(min(pos.y(), r0.bottom() - 4))
+            elif which == 5:
+                r.setRight(max(pos.x(), r0.left() + 4))
+            elif which == 6:
+                r.setBottom(max(pos.y(), r0.top() + 4))
+            else:
+                r.setLeft(min(pos.x(), r0.right() - 4))
+        self.place(r.intersected(bounds) if not self.square else r, self.square)
+        self.editor.crop_moved(self.scene_rect())
 
     def itemChange(self, change, value):
-        if change == QtWidgets.QGraphicsItem.GraphicsItemChange.ItemPositionHasChanged:
-            self._on_move()
+        if change == QtWidgets.QGraphicsItem.GraphicsItemChange.ItemPositionHasChanged and not self._silent:
+            self.editor.crop_moved(self.scene_rect())
         return super().itemChange(change, value)
 
 
 class FrameEditor(QtWidgets.QGraphicsView):
-    """Shows the source image with the detected frame; the four corners can be dragged."""
-    edited = QtCore.Signal()
+    """Shows the source image with the seal's frame. With the crop switched on, a crop box
+    can be dragged and resized instead."""
+    cropped = QtCore.Signal(list)              # the crop box changed: [x0, y0, x1, y1] in source pixels
 
     def __init__(self):
         super().__init__()
@@ -1351,19 +1601,16 @@ class FrameEditor(QtWidgets.QGraphicsView):
         self.setAcceptDrops(False)
         self.viewport().setAcceptDrops(False)
         self.setMinimumWidth(220)
-        self.pix = self.shade = self.poly = None
-        self.handles: list[Handle] = []
+        self.pix = self.shade = self.poly = self.crop_box = None
         self.image_rect = QRectF()
         self.auto_fit = True
-        self._silent = False
 
     def retheme(self):
         self.setBackgroundBrush(QtGui.QColor(C["canvas"]))
 
     def clear(self):
         self.scene().clear()
-        self.pix = self.shade = self.poly = None
-        self.handles = []
+        self.pix = self.shade = self.poly = self.crop_box = None
         self.viewport().update()
 
     def set_image(self, qimg: QtGui.QImage, corners):
@@ -1378,32 +1625,14 @@ class FrameEditor(QtWidgets.QGraphicsView):
         pen = QtGui.QPen(QtGui.QColor(CINNABAR), 1.6)
         pen.setCosmetic(True)
         self.poly = sc.addPolygon(QtGui.QPolygonF(), pen)
-        for _ in range(4):
-            h = Handle(self._moved)
-            sc.addItem(h)
-            self.handles.append(h)
         self.set_corners(corners)
         self.fit()
 
     def set_corners(self, corners):
-        self._silent = True
-        for h, (x, y) in zip(self.handles, np.asarray(corners, dtype=float)):
-            h.setPos(x + 0.5, y + 0.5)              # scene pixels cover [x, x+1)
-        self._silent = False
-        self._redraw()
-
-    def corners(self) -> np.ndarray:
-        return np.array([[h.pos().x() - 0.5, h.pos().y() - 0.5] for h in self.handles])
-
-    def _moved(self):
-        self._redraw()
-        if not self._silent:
-            self.edited.emit()
-
-    def _redraw(self):
-        if self.poly is None or len(self.handles) < 4:
+        """Show the frame in use: a dimmed image outside it, a red line along it."""
+        if self.poly is None:
             return
-        quad = QtGui.QPolygonF([h.pos() for h in self.handles])
+        quad = QtGui.QPolygonF([QPointF(x + 0.5, y + 0.5) for x, y in np.asarray(corners, dtype=float)])
         self.poly.setPolygon(quad)
         path = QtGui.QPainterPath()
         path.setFillRule(Qt.FillRule.OddEvenFill)
@@ -1411,6 +1640,23 @@ class FrameEditor(QtWidgets.QGraphicsView):
         path.addPolygon(quad)
         path.closeSubpath()
         self.shade.setPath(path)
+
+    def set_crop(self, crop, square: bool):
+        """Show the crop box (crop: [x0, y0, x1, y1] in source pixels), or hide it (None)."""
+        if crop is None:
+            if self.crop_box is not None:
+                self.scene().removeItem(self.crop_box)
+                self.crop_box = None
+            return
+        if self.crop_box is None and self.pix is not None:
+            self.crop_box = CropBox(self)
+            self.scene().addItem(self.crop_box)
+        if self.crop_box is not None:
+            x0, y0, x1, y1 = crop
+            self.crop_box.place(QRectF(x0 + 0.5, y0 + 0.5, x1 - x0, y1 - y0), square)
+
+    def crop_moved(self, r: QRectF):
+        self.cropped.emit([r.left() - 0.5, r.top() - 0.5, r.right() - 0.5, r.bottom() - 0.5])
 
     def fit(self):
         if self.pix is None:
@@ -1444,7 +1690,7 @@ class FrameEditor(QtWidgets.QGraphicsView):
         self._pixel_mode()
 
     def mouseDoubleClickEvent(self, e):
-        if not isinstance(self.itemAt(e.position().toPoint()), Handle):
+        if not isinstance(self.itemAt(e.position().toPoint()), (CropHandle, CropBox)):
             self.fit()
         else:
             super().mouseDoubleClickEvent(e)
@@ -2518,6 +2764,10 @@ class EditorView(QtWidgets.QGraphicsView):
         pen.setCosmetic(True)
         self.centre = self.scene().addPath(QtGui.QPainterPath(), pen)
         self.centre.setZValue(2)
+        pen = QtGui.QPen(QtGui.QColor(CINNABAR), 1.5, Qt.PenStyle.DashLine)
+        pen.setCosmetic(True)
+        self.lasso = self.scene().addPath(QtGui.QPainterPath(), pen)
+        self.lasso.setZValue(3)
         pen = QtGui.QPen(QtGui.QColor(CINNABAR), 1.5)
         pen.setCosmetic(True)
         self.brush = self.scene().addEllipse(QRectF(), pen)
@@ -2626,6 +2876,8 @@ class CharacterEditor(QtWidgets.QDialog):
         self.tool = "strokes"
         self.erase_pts: list = []
         self.erase_live = None
+        self.lasso_poly = self.move_from = self.move_mask = self.move_d = None
+        self.lasso_pts: list = []
         outer = QtWidgets.QHBoxLayout(self)
         outer.setSpacing(12)
         left = QtWidgets.QVBoxLayout()
@@ -2634,6 +2886,7 @@ class CharacterEditor(QtWidgets.QDialog):
         tools.addWidget(QtWidgets.QLabel("Tool"))
         self.tool_buttons = {}
         for key, label, tip in (("strokes", "Strokes", "Draw along a stroke to select it, then drag it"),
+                                ("lasso", "Lasso", "Draw around part of the character, then drag it somewhere else"),
                                 ("erase", "Eraser", "Paint over ink to erase it")):
             b = QtWidgets.QPushButton(label)
             b.setCheckable(True)
@@ -2693,14 +2946,21 @@ class CharacterEditor(QtWidgets.QDialog):
         self.lbl_len = QtWidgets.QLabel()
         sv.addLayout(_slider_row(self.sld_len, self.lbl_len))
 
+        row, self.orig_move = section_with_original("Move", "Show the character without the parts you moved")
+        sv.addLayout(row)
+        sv.addWidget(muted_label("Pick Lasso above the character, draw around a part, then drag it."))
+
         row, self.orig_erase = section_with_original("Eraser", "Show the character without what you erased")
         sv.addLayout(row)
         sv.addWidget(muted_label("Pick Eraser above the character, then paint over ink to erase it."))
 
         row, self.orig_weight = section_with_original("Weight", "Show the strokes at their original weight")
         sv.addLayout(row)
-        self.sld_weight = slider(-5, 5, "Left for thinner strokes, right for bolder")
-        sv.addWidget(self.sld_weight)
+        self.sld_weight = slider(-50, 50, "Left for thinner strokes, right for bolder, in fine steps")
+        self.lbl_weight = QtWidgets.QLabel()
+        self.lbl_weight.setToolTip("How much thicker or thinner every stroke gets on the printed seal")
+        sv.addLayout(_slider_row(self.sld_weight, self.lbl_weight))
+        self.lbl_weight.setMinimumWidth(self.lbl_weight.fontMetrics().horizontalAdvance("−0.00 mm") + 4)
         self.chk_invert = QtWidgets.QCheckBox("Invert this character")
         sv.addWidget(self.chk_invert)
         sv.addStretch(1)
@@ -2728,6 +2988,7 @@ class CharacterEditor(QtWidgets.QDialog):
         self.orig_strokes.setChecked(not w.use_strokes)
         self.orig_lengthen.setChecked(not w.use_lengthen)
         self.orig_erase.setChecked(not w.use_erase)
+        self.orig_move.setChecked(not w.use_move)
         self.orig_weight.setChecked(not w.use_weight)
         self._loading = False
         for s in (self.sld_sq_h, self.sld_sq_v):
@@ -2740,24 +3001,28 @@ class CharacterEditor(QtWidgets.QDialog):
         self.orig_strokes.toggled.connect(self.on_stroke_originals)
         self.orig_lengthen.toggled.connect(self.on_stroke_originals)
         self.orig_erase.toggled.connect(self.on_stroke_originals)
+        self.orig_move.toggled.connect(self.on_stroke_originals)
         self.btn_undo.clicked.connect(self.undo)
         self.btn_restart.clicked.connect(self.start_over)
         undo = QtGui.QShortcut(QtGui.QKeySequence(QtGui.QKeySequence.StandardKey.Undo), self)
         undo.activated.connect(self.undo)
         fit_to_screen(self, 1040, 720)
         self.update_controls()
+        self.on_weight()
         self.on_squish()
 
     # ---- whole-character settings and the Original switches
     def editable(self) -> bool:
-        return self.work.use_strokes and self.work.use_lengthen and self.work.use_erase
+        return self.work.use_strokes and self.work.use_lengthen and self.work.use_erase and self.work.use_move
 
     def set_tool(self, tool: str):
         self.finish_lengthen()
         self.tool = tool
         self.tool_buttons[tool].setChecked(True)
-        if tool == "erase":
+        if tool != "strokes":
             self.sel = self.centre = self.sel_path = None
+        if tool != "lasso":
+            self.lasso_poly = None
         self.view.brush.setVisible(False)
         self.update_controls()
         self.refresh()
@@ -2786,9 +3051,12 @@ class CharacterEditor(QtWidgets.QDialog):
         self.lbl_len.setText(f"{self.sld_len.value()}%")
         self.sld_brush.setEnabled(self.tool == "erase" and self.editable())
         if not self.editable():
-            self.hint.setText("Turn off Original under Strokes, Lengthen and Eraser to change strokes.")
+            self.hint.setText("Turn off Original under Strokes, Lengthen, Move and Eraser to change strokes.")
         elif self.tool == "erase":
             self.hint.setText("Paint over ink to erase it. Ctrl+Z undoes.")
+        elif self.tool == "lasso":
+            self.hint.setText("Drag inside the outline to move that part, or draw a new outline."
+                              if self.lasso_poly is not None else "Draw around the part you want to move.")
         elif self.sel is None and self.drag is None:
             self.hint.setText("Draw along a stroke, or along just the part of it you want to change, to select it.")
 
@@ -2802,6 +3070,8 @@ class CharacterEditor(QtWidgets.QDialog):
     def on_weight(self, *_):
         self.work.weight = self.sld_weight.value()
         self.work.invert = self.chk_invert.isChecked()
+        change = 2 * self.work.weight * max(self.work.src.shape) * WEIGHT_STEP * self.work.scale
+        self.lbl_weight.setText(f"{change:+.2f} mm".replace("-", "−") if self.work.weight else "0 mm")
         self.refresh()
 
     def on_originals(self, *_):
@@ -2815,6 +3085,7 @@ class CharacterEditor(QtWidgets.QDialog):
         self.work.use_strokes = not self.orig_strokes.isChecked()
         self.work.use_lengthen = not self.orig_lengthen.isChecked()
         self.work.use_erase = not self.orig_erase.isChecked()
+        self.work.use_move = not self.orig_move.isChecked()
         QtWidgets.QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
             self.canvas = edit_canvas(self.work)       # replay only the edits that are switched on
@@ -2827,11 +3098,22 @@ class CharacterEditor(QtWidgets.QDialog):
         sx, sy = char_scale(self.work)
         return np.array([pt.x() / sx, pt.y() / sy], dtype=np.float64)
 
-    def refresh(self, canvas=None, sel=None, centre=None, fit=False):
+    def refresh(self, canvas=None, sel=None, centre=None, fit=False, poly=None):
         w = self.work
         g = self.canvas if canvas is None else canvas
         if canvas is None:
             sel, centre = (self.sel, self.centre) if self.tool == "strokes" else (None, None)
+            if self.tool == "lasso" and self.lasso_poly is not None:
+                poly = self.lasso_poly
+                sel = g & lasso_mask(g.shape, poly)
+        outline = QtGui.QPainterPath()
+        if poly is not None and len(poly) > 2:
+            sx0, sy0 = char_scale(w)
+            outline.moveTo(poly[0][0] * sx0, poly[0][1] * sy0)
+            for x, y in poly[1:]:
+                outline.lineTo(x * sx0, y * sy0)
+            outline.closeSubpath()
+        self.view.lasso.setPath(outline)
         shown = thicken(g, w.weight, max(w.src.shape)) if w.use_weight else g
         H, W = shown.shape
         sx, sy = char_scale(w)
@@ -2882,6 +3164,20 @@ class CharacterEditor(QtWidgets.QDialog):
             return
         self.finish_lengthen()
         b = self.to_canvas(pt)
+        if self.tool == "lasso":
+            inside = self.lasso_poly is not None and cv2.pointPolygonTest(
+                self.lasso_poly.astype(np.float32).reshape(-1, 1, 2), (float(b[0]), float(b[1])), False) >= 0
+            if inside:                                # pick up the part inside the outline
+                self.move_from = b
+                self.move_mask = lasso_mask(self.canvas.shape, self.lasso_poly)
+            else:                                     # start a new outline
+                self.lasso_poly = None
+                self.lasso_pts = [b]
+                path = QtGui.QPainterPath()
+                path.moveTo(pt)
+                self.view.trace.setPath(path)
+                self.refresh()
+            return
         if self.tool == "erase":
             self.erase_pts = [b]
             self.erase_live = erase_mask(self.canvas.shape, [b], self.brush_radius())
@@ -2902,6 +3198,16 @@ class CharacterEditor(QtWidgets.QDialog):
             self.view.trace.setPath(p)
 
     def move(self, pt):
+        if self.move_from is not None:
+            self.move_d = self.to_canvas(pt) - self.move_from
+            self.timer.start()
+            return
+        if self.lasso_pts:
+            self.lasso_pts.append(self.to_canvas(pt))
+            path = self.view.trace.path()
+            path.lineTo(pt)
+            self.view.trace.setPath(path)
+            return
         if self.erase_pts:
             b = self.to_canvas(pt)
             r = max(1, int(round(self.brush_radius())))
@@ -2922,6 +3228,28 @@ class CharacterEditor(QtWidgets.QDialog):
             self.view.trace.setPath(p)
 
     def release(self, pt):
+        if self.move_from is not None:
+            d = self.to_canvas(pt) - self.move_from
+            self.timer.stop()
+            self.move_from = self.move_mask = self.move_d = None
+            if np.hypot(*d) >= 0.5:
+                op = {"kind": "move", "poly": (self.lasso_poly - self.pad).round(2).tolist(),
+                      "d": [round(float(d[0]), 2), round(float(d[1]), 2)]}
+                self.remember()
+                self.canvas = apply_op(self.canvas, op, self.pad)[0]
+                self.work.ops.append(op)
+                self.lasso_poly = self.lasso_poly + d  # the outline goes with the part
+            self.update_controls()
+            self.refresh()
+            return
+        if self.lasso_pts:
+            pts, self.lasso_pts = np.array(self.lasso_pts), []
+            self.view.trace.setPath(QtGui.QPainterPath())
+            ok = len(pts) > 3 and np.ptp(pts[:, 0]) > 3 and np.ptp(pts[:, 1]) > 3
+            self.lasso_poly = pts if ok else None
+            self.update_controls()
+            self.refresh()
+            return
         if self.erase_pts:
             self.timer.stop()
             op = {"kind": "erase", "points": (np.asarray(self.erase_pts) - self.pad).round(2).tolist(),
@@ -2963,7 +3291,11 @@ class CharacterEditor(QtWidgets.QDialog):
         self.refresh()
 
     def _preview(self):
-        if self.erase_live is not None:
+        if self.move_from is not None and self.move_d is not None:
+            moved = move_part(self.canvas, self.move_mask, self.move_d)
+            poly = self.lasso_poly + self.move_d
+            self.refresh(moved, moved & lasso_mask(moved.shape, poly), None, poly=poly)
+        elif self.erase_live is not None:
             self.refresh(self.canvas & ~self.erase_live, None, None)
         elif self.drag is not None and self.pending is not None:
             self.refresh(*self.drag.apply(self.pending))
@@ -2971,6 +3303,7 @@ class CharacterEditor(QtWidgets.QDialog):
     def clear_selection(self):
         self.finish_lengthen()
         self.sel = self.centre = self.sel_path = None
+        self.lasso_poly = None
         self.update_controls()
         self.refresh()
 
@@ -4173,7 +4506,14 @@ class MainWindow(QtWidgets.QMainWindow):
         row.addWidget(self.btn_detect)
         row.addWidget(self.btn_whole)
         col.addLayout(row)
-        col.addWidget(self._muted("Drag the red corners to adjust. Scroll to zoom, double-click to fit."))
+        self.chk_crop = QtWidgets.QCheckBox("Crop manually")
+        self.chk_crop.setToolTip("Draw the seal's area by hand instead of using the frame found automatically.\n"
+                                 "Switch it off to go back to the automatic frame.")
+        col.addWidget(self.chk_crop)
+        self.lbl_crop_hint = self._muted("Drag the crop box's corners and sides, or drag inside it to move it. "
+                                         "Scroll to zoom, double-click to fit.")
+        self.lbl_crop_hint.hide()
+        col.addWidget(self.lbl_crop_hint)
 
         # Settings of the selected seal
         col.addWidget(self._section("This seal"))
@@ -4224,6 +4564,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sld_smooth.setToolTip("Rounds off jagged pixel steps from small screenshots before\n"
                                    "the seal is turned into black and white")
         col.addWidget(self.sld_smooth)
+        self.chk_xsmooth = QtWidgets.QCheckBox("Extra smooth")
+        self.chk_xsmooth.setToolTip("Redraws every outline as clean curves, a best guess at the intended strokes:\n"
+                                    "straight edges come out straight and curves even, specks, pinholes and\n"
+                                    "ragged edges disappear, and real corners stay sharp")
+        col.addWidget(self.chk_xsmooth)
         self.chk_invert = QtWidgets.QCheckBox("Invert")
         self.chk_invert.setToolTip("Swap black and white for this seal")
         col.addWidget(self.chk_invert)
@@ -4348,7 +4693,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Widgets that edit the selected seal
         self.per_seal = (self.btn_save, self.btn_remove, self.cmb_ink, self.btn_detect, self.btn_whole, self.cmb_shape, self.spn_size,
-                         self.spn_copies, self.btn_auto_t, self.sld_weight, self.sld_smooth, self.chk_invert)
+                         self.spn_copies, self.btn_auto_t, self.sld_weight, self.sld_smooth, self.chk_invert, self.chk_crop, self.chk_xsmooth)
 
         def action(keys, slot):
             a = QtGui.QAction(self)
@@ -4376,7 +4721,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cmb_shape.currentIndexChanged.connect(self.on_shape_changed)
         self.btn_detect.clicked.connect(self.redetect)
         self.btn_whole.clicked.connect(self.use_whole)
-        self.editor.edited.connect(self.on_frame_edited)
+        self.editor.cropped.connect(self.on_crop_changed)
+        self.chk_crop.toggled.connect(self.on_crop_toggled)
+        self.chk_xsmooth.toggled.connect(self.on_extra_smooth)
         self.spn_size.valueChanged.connect(lambda v: self._set("size", v))
         self.spn_copies.valueChanged.connect(lambda v: self._set("copies", v))
         self.chk_invert.toggled.connect(lambda v: self._set("invert", v))
@@ -4621,6 +4968,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.lbl_frame.setText("")
         elif job is not self.cur:
             self.editor.set_image(rgb_to_qimage(job.rgb), job.corners)
+            self.editor.set_crop(job.crop if job.use_crop else None, job.square)
         self.cur = job
         self._fill_controls()
         self.schedule()
@@ -4638,6 +4986,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.spn_copies.setValue(job.copies)
             self.sld_smooth.setValue(job.smooth)
             self.chk_invert.setChecked(job.invert)
+            self.chk_xsmooth.setChecked(job.extra_smooth)
+            self.chk_crop.setChecked(job.use_crop)
             self.sld_weight.setValue(job.weight)
             self.btn_auto_t.setEnabled(not job.auto_t)
             h, w = job.rgb.shape[:2]
@@ -4650,6 +5000,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.spn_copies.setValue(self.default_copies)
             self.sld_smooth.setValue(self.default_smooth)
         self.on_smooth(self.sld_smooth.value())
+        self.lbl_crop_hint.setVisible(job is not None and job.use_crop)
         self._shape_labels()
         self._mode_note()
         n = len(self.jobs)
@@ -4666,7 +5017,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.cur.detect()
         finally:
             QtWidgets.QApplication.restoreOverrideCursor()
-        self.editor.set_corners(self.cur.corners)
+        self._crop_off()
         self.btn_auto_t.setEnabled(False)
         self._mode_note()
         self.schedule()
@@ -4675,18 +5026,60 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.cur is None:
             return
         h, w = self.cur.rgb.shape[:2]
-        self.cur.corners = whole_image_corners(w, h)
-        self.cur.frame_manual = True
+        self.cur.auto_corners = whole_image_corners(w, h)
+        self.cur.auto_manual = True
+        self.cur.use_crop = False
+        self.cur.apply_crop()
         self.cur.auto_t = True
         self.btn_auto_t.setEnabled(False)
-        self.editor.set_corners(self.cur.corners)
+        self._crop_off()
         self.schedule()
 
-    def on_frame_edited(self):
-        if self.cur is None:
+    def _crop_off(self):
+        """Show the automatic frame, with the crop switch off."""
+        self._loading = True
+        self.chk_crop.setChecked(False)
+        self._loading = False
+        self.lbl_crop_hint.hide()
+        self.editor.set_crop(None, True)
+        self.editor.set_corners(self.cur.corners)
+
+    @staticmethod
+    def _square_crop(crop):
+        x0, y0, x1, y1 = crop
+        side = max(x1 - x0, y1 - y0)
+        cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+        return [cx - side / 2, cy - side / 2, cx + side / 2, cy + side / 2]
+
+    def on_crop_toggled(self, on: bool):
+        job = self.cur
+        if self._loading or job is None:
             return
-        self.cur.corners = self.editor.corners()
-        self.cur.frame_manual = True
+        job.use_crop = on
+        if on and job.crop is None:                   # start from the frame in use
+            c = np.asarray(job.corners, dtype=float)
+            job.crop = [*c.min(axis=0), *c.max(axis=0)]
+        if on and job.square:
+            job.crop = self._square_crop(job.crop)
+        job.apply_crop()
+        self.editor.set_crop(job.crop if on else None, job.square)
+        self.editor.set_corners(job.corners)
+        self.lbl_crop_hint.setVisible(on)
+        self.schedule()
+
+    def on_crop_changed(self, crop: list):
+        job = self.cur
+        if job is None or not job.use_crop:
+            return
+        job.crop = crop
+        job.apply_crop()
+        self.editor.set_corners(job.corners)
+        self.schedule()
+
+    def on_extra_smooth(self, on: bool):
+        if self._loading or self.cur is None:
+            return
+        self.cur.extra_smooth = on
         self.schedule()
 
     def on_ink_changed(self, *_):
@@ -4708,7 +5101,14 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._loading or self.cur is None:
             return
         self.cur.square = self.cmb_shape.currentData() == "square"
-        if self.cur.frame_manual:
+        if self.cur.use_crop:                  # a square seal's crop is square
+            if self.cur.square:
+                self.cur.crop = self._square_crop(self.cur.crop)
+                self.cur.apply_crop()
+            self.editor.set_crop(self.cur.crop, self.cur.square)
+            self.editor.set_corners(self.cur.corners)
+            self.schedule()
+        elif self.cur.frame_manual:
             self.schedule()                    # keep the hand-placed frame
         else:
             self.redetect()                    # a square seal's box is squared, other shapes' isn't

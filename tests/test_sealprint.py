@@ -243,7 +243,8 @@ def test_builds_from_earlier_versions_still_open(tmp_path):
     (d / "build.json").write_text(json.dumps(old), "utf-8")
     b = sp.load_build({"dir": d})
     p = b.chars[0]
-    assert p.src.shape == (150, 100) and p.weight == 1   # the old lengthening is baked into the picture
+    assert p.src.shape == (150, 100)                     # the old lengthening is baked into the picture
+    assert p.weight == 10                                # and weight is in today's finer steps
     x, y, w, h = sp.char_rect(p)
     assert abs(x + w / 2 - 10) < 0.3 and abs(y + h / 2 - 10) < 0.3 and h > w
 
@@ -305,3 +306,67 @@ def test_round_corners():
     assert ink[100, :10].all() and not ink[100, 12]
     d = 40 - 40 / math.sqrt(2)                           # on the diagonal, the frame follows the curve
     assert ink[int(d) + 3, int(d) + 3] and not ink[int(d) + 14, int(d) + 14]
+
+
+# ───────────────────────────── finer weight, lasso, extra smooth, main-page crop
+
+def test_weight_moves_edges_in_fine_steps():
+    g = glyph_cross(400, 40)                             # strokes 40 px wide
+    widths = []
+    for w in (0, 1, 2, 3, 10, -10):
+        cov = sp.thicken(g, w, 400, soft=True)
+        widths.append(float(cov[:, 100].sum()))          # across the horizontal stroke, with fractions
+    step = 2 * 400 * sp.WEIGHT_STEP                      # each step adds 0.2 px across a stroke
+    assert widths[1] == pytest.approx(40 + step, abs=0.05) and widths[2] == pytest.approx(40 + 2 * step, abs=0.05)
+    assert widths[4] == pytest.approx(40 + 10 * step, abs=0.1) and widths[5] == pytest.approx(40 - 10 * step, abs=0.1)
+
+
+def test_lasso_moves_part_of_a_character():
+    g = glyph_cross(200, 20)                             # bar rows 90-109
+    p = sp.Placed("g", "十", g, cx=10, cy=10, scale=0.05)
+    p.ops = [{"kind": "move", "poly": [[150, 80], [200, 80], [200, 120], [150, 120]], "d": [0, 30]}]
+    p.cache = None
+    img, ox, oy = sp.process_char(p)
+    moved = np.zeros((260, 260), bool)
+    moved[oy:oy + img.shape[0], ox:ox + img.shape[1]] = img[:max(0, 260 - oy), :max(0, 260 - ox)] if oy >= 0 and ox >= 0 else False
+    canvas = sp.edit_canvas(p)
+    pad = sp.edit_pad(p)
+    assert not canvas[pad + 100, pad + 175] and canvas[pad + 130, pad + 175]   # the bar's end went down 30
+    assert canvas[pad + 100, pad + 120]                  # the rest stayed
+    p.use_move = False
+    assert sp.edit_canvas(p)[pad + 100, pad + 175]
+
+
+def test_extra_smooth_straightens_ragged_edges_and_keeps_corners():
+    rng = np.random.default_rng(3)
+    sq = np.zeros((400, 400), bool)
+    sq[80:320, 80:320] = True
+    edge = 318 + rng.integers(-2, 3, 240)                # a ragged right edge, +-2 px
+    for i, x in enumerate(edge):
+        sq[80 + i, 300:x], sq[80 + i, x:330] = True, False
+    sq[150:154, 150:154] = False                         # a pinhole
+    sq[20:22, 20:22] = True                              # a speck
+    out = sp.smooth_strokes(sq)
+    assert all(out[y, x] for y, x in ((81, 81), (318, 81), (81, 316), (318, 316)))   # corners stay sharp
+    rights = [np.nonzero(out[y, 300:330])[0].max() for y in range(100, 300, 10)]
+    assert max(rights) - min(rights) <= 2 < edge.max() - edge.min()                  # straighter edge
+    assert out[151, 151] and not out[20, 20]             # pinhole filled, speck gone
+
+
+def test_main_page_crop_switches_back_to_the_automatic_frame(tmp_path, monkeypatch):
+    monkeypatch.setattr(sp, "LIBRARY", tmp_path / "library")
+    job = sp.SealJob(sp.load_image(str(IMAGES / "oval.png")), "oval", size=30, square=False)
+    job.detect()
+    auto = job.corners.copy()
+    job.crop, job.use_crop, job.extra_smooth = [100.0, 90.0, 300.0, 400.0], True, True
+    job.apply_crop()
+    assert job.frame_manual and job.corners.min(axis=0).tolist() == [100, 90]
+    job.update_preview(False)
+    sp.save_to_library(job, "oval")
+    again = sp.job_from_library(sp.library_entries()[0])
+    assert again.use_crop and again.extra_smooth
+    shift = np.asarray(job.corners) - np.asarray(again.corners)
+    assert np.allclose(np.asarray(job.crop) - np.asarray(again.crop), [shift[0, 0], shift[0, 1]] * 2)
+    again.use_crop = False
+    again.apply_crop()                                   # crop off: the automatic frame again
+    assert np.allclose(again.corners + shift[0], auto) and not again.frame_manual
