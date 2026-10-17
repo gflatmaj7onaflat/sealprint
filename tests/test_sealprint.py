@@ -370,3 +370,40 @@ def test_main_page_crop_switches_back_to_the_automatic_frame(tmp_path, monkeypat
     again.use_crop = False
     again.apply_crop()                                   # crop off: the automatic frame again
     assert np.allclose(again.corners + shift[0], auto) and not again.frame_manual
+
+
+def test_a_dashed_border_counts_as_part_of_the_seal():
+    """A free-form seal whose outline is solid at the bottom but only dashes across the top."""
+    img = np.full((900, 500, 3), 255, np.uint8)
+    red = (200, 20, 20)
+    cv2.ellipse(img, (250, 470), (200, 420), 0, 0, 180, red, 8)            # solid lower half
+    for a0 in range(180, 360, 12):                                          # dashed upper half
+        cv2.ellipse(img, (250, 470), (200, 420), 0, a0, a0 + 6, red, 8)
+    for y in range(250, 700, 150):                                          # some "characters"
+        cv2.rectangle(img, (170, y), (330, y + 110), red, 12)
+        cv2.line(img, (170, y + 55), (330, y + 55), red, 12)
+    corners, mode, found, _ = sp.detect_frame(img, "auto", square=False)
+    c = np.asarray(corners)
+    assert mode == "red" and found
+    assert c[:, 1].min() < 60 and c[:, 1].max() > 880                      # the whole height, 46-894
+    assert c[:, 0].min() < 60 and c[:, 0].max() > 440
+
+
+def test_any_saved_seal_opens_as_a_build_and_saves_as_a_copy(tmp_path, monkeypatch):
+    monkeypatch.setattr(sp, "LIBRARY", tmp_path / "library")
+    job = sp.SealJob(sp.load_image(str(IMAGES / "oval.png")), "閒章", size=30, square=False)
+    job.detect()
+    job.update_preview(False)
+    sid = sp.save_to_library(job, "閒章")
+    [entry] = sp.library_entries()
+    b = sp.seal_as_build(entry)
+    w, h = job.dims()
+    assert (b.shape, b.frame_mm, len(b.chars)) == ("rect", 0.0, 1)
+    assert (b.w_mm, b.h_mm) == pytest.approx((w, h), abs=0.01)
+    x, y, cw, ch = sp.char_rect(b.chars[0])                    # the seal fills its format
+    assert x < 1 and y < 1 and x + cw > w - 1 and y + ch > h - 1
+    assert sp.copy_name("閒章") == "閒章 copy"
+    copy_id = sp.save_build(b, sp.copy_name("閒章"), None)
+    assert copy_id != sid and sp.copy_name("閒章 copy") == "閒章 copy 2"
+    names = sorted(e["name"] for e in sp.library_entries())
+    assert names == ["閒章", "閒章 copy"]

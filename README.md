@@ -8,8 +8,8 @@ physical size on A4, ready to transfer onto a seal stone.
 ## What it does
 
 - **Finds the seal by itself.** Rough screenshots are fine: extra margin, captions, a dark image-viewer
-  background, a slight tilt or a chipped border. If the frame is off, Crop manually lets you draw the
-  seal's area yourself.
+  background, a slight tilt, a chipped border, or the dashed outline of a free-form seal. If the frame
+  is off, Crop manually lets you draw the seal's area yourself.
 - **Pure black and white.** The PDF holds a lossless 1-bit image at 1200 dpi. Red seal paste is read
   separately from black calligraphy around it, and stroke weight and edge smoothing are adjustable.
 - **Extra smooth.** For rough impressions: redraws every outline as clean curves, a best guess at the
@@ -22,14 +22,17 @@ physical size on A4, ready to transfer onto a seal stone.
 - **Exact size, even on stubborn printers.** For self-service printers that always shrink pages to fit,
   the Enlarge setting compensates, and Calibrate works out the number from a test print.
 - **Close-up inspection.** Click the black-and-white seal to zoom into the exact pixels that get printed.
-- **Seal library.** Save a seal with its frame and settings, then load it onto any later sheet.
+- **Seal library.** Save a seal with its frame and settings, then load it onto any later sheet. Sort it
+  by when seals last changed, or by name.
 - **A library of characters.** Cut single characters out of your saved seals, with a box or an outline
   drawn by hand, and name them. Each one remembers the seal it came from, and you can search by either.
-- **Build new seals.** Compose a seal from your characters: square, rectangle, circle, oval or your own
-  size, with the frame thickness you choose, round corners, and red or white text. Characters are laid
-  out in reading order (columns from right to left), then can be moved, scaled, squished, cropped and
-  overlapped on a canvas that zooms and has guides through the middle. Built seals print and load like
-  any other seal, and stay editable.
+- **Build new seals.** Compose a seal from your characters, or from whole saved seals: square, rectangle,
+  circle, oval or your own size, with the frame thickness you choose, round corners, and red or white
+  text. Characters are laid out in reading order (columns from right to left), then can be moved,
+  scaled, squished, cropped and overlapped on a canvas that zooms and has guides through the middle.
+  Built seals print and load like any other seal.
+- **Change any seal, safely.** Edit build opens a copy of any saved seal, built or scanned, with all the
+  build and editing tools. Saving makes a new seal; the original stays as it is.
 - **Edit characters down to single strokes.** Squish a character horizontally or vertically and set its
   weight in fine steps. Draw along a stroke, or part of one, to select it, then drag it to stretch or
   bend it like dough, or lengthen it at its free end. A lasso moves parts of a character, and an eraser
@@ -78,9 +81,10 @@ warning, then go to **System Settings → Privacy & Security**, scroll down to S
    shapes) and the number of copies. Stroke weight, Smooth edges, Extra smooth and Invert tune the
    black-and-white result. Right-click a seal in the strip to duplicate or remove it.
 4. **Load…** opens the seal library. Under Saved seals, **Pick characters…** cuts single characters
-   out of the selected seal (drag a box, or switch to Draw to outline one by hand) and names them.
-   **Build from scratch** composes a new seal from them; it is saved to the library like any other
-   seal, and **Edit build** reopens it later. The Handles switch under the seal sets what a
+   out of the selected seal (drag a box, or switch to Draw to outline one by hand) and names them,
+   and **Edit build** opens a copy of the selected seal to change. **Build from scratch** composes a
+   new seal from your characters or whole saved seals (the Characters / Seals switch under Add); it
+   is saved to the library like any other seal. The Handles switch under the seal sets what a
    character's handles do: Scale (keeps its proportions), Squish or Crop. Double-click a character to
    open its editor: squish, strokes (draw along a stroke to select it, drag the selection to stretch
    or bend it, right-click to clear it, Ctrl+Z to undo), lengthen the selected stroke, Lasso to move a

@@ -16,6 +16,7 @@ import argparse
 import json
 import math
 import os
+import re
 import shutil
 import sys
 import time
@@ -29,7 +30,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import QPointF, QRectF, Qt
 
 APP_NAME = "Seal Print"
-__version__ = "1.5.0"
+__version__ = "1.6.0"
 A4_W, A4_H = 210.0, 297.0           # page size, mm
 PAGE_MARGIN = 10.0                  # mm kept clear at the paper edge
 EXPORT_DPI = 1200                   # resolution of the seal image inside the PDF
@@ -145,6 +146,58 @@ class _Cluster:
     ys: np.ndarray
 
 
+def _extend_outline(lab: np.ndarray, st: np.ndarray, xs: np.ndarray, ys: np.ndarray, used, min_area: float):
+    """Add the pieces of a dashed or broken border: thin pieces just outside the seal that run
+    along its outline, taken one after another so a whole row of dashes joins. Captions and
+    nearby writing don't line up with the outline, so they stay out; and if what joined ends up
+    inside the seal rather than around its edge, it wasn't a border and is left out again."""
+    pts = np.column_stack([xs, ys]).astype(np.float32)
+    size = float(max(np.ptp(xs), np.ptp(ys)) + 1)
+    gap = 0.06 * size
+    cap = (xs.min() - size, ys.min() - size, xs.max() + size, ys.max() + size)   # never more than double
+    cand = []
+    for i in range(1, len(st)):
+        x, y, w, h, area = (int(v) for v in st[i])
+        if i in used or area < min_area or x < cap[0] or y < cap[1] or x + w > cap[2] or y + h > cap[3]:
+            continue
+        py, px = np.nonzero(lab[y:y + h, x:x + w] == i)
+        piece = np.column_stack([px + x, py + y]).astype(np.float32)
+        (cx, cy), (rw, rh), ang = cv2.minAreaRect(piece)
+        if max(rw, rh) < 2.5 * max(1.0, min(rw, rh)):
+            continue                                   # a dot or a blob, not a stretch of border
+        a = math.radians(ang if rw >= rh else ang + 90)
+        reach = min(0.15 * size, max(gap, 1.5 * max(rw, rh)))   # dashes are spaced about as long as they are
+        cand.append((piece, (float(cx), float(cy)), np.array([math.cos(a), math.sin(a)]), reach))
+    joined = []
+    grew = True
+    while grew and cand:
+        grew = False
+        hull = cv2.convexHull(pts)
+        hp = hull[:, 0, :]
+        ea, ab = hp, np.roll(hp, -1, axis=0) - hp
+        for k, (piece, (cx, cy), d, reach) in enumerate(cand):
+            inside = cv2.pointPolygonTest(hull, (cx, cy), True)
+            if inside > 0 or -inside > reach:
+                continue
+            t = np.clip(((np.array([cx, cy]) - ea) * ab).sum(1) / np.maximum((ab ** 2).sum(1), 1e-9), 0, 1)
+            dist = np.hypot(*(ea + t[:, None] * ab - [cx, cy]).T)
+            near = dist <= dist.min() + 0.5 * gap      # the hull edges near it (two meet at a corner)
+            dirs = ab[near] / np.maximum(np.hypot(ab[near, 0], ab[near, 1]), 1e-9)[:, None]
+            if np.abs(dirs @ d).max() < math.cos(math.radians(35)):
+                continue                               # not running along the outline
+            pts = np.vstack([pts, piece])
+            joined.append((cx, cy))
+            cand.pop(k)
+            grew = True
+            break
+    if joined:                                         # a border stays on the outside
+        hull = cv2.convexHull(pts)
+        buried = sum(cv2.pointPolygonTest(hull, c, True) > 1.5 * gap for c in joined)
+        if buried > 0.3 * len(joined):
+            return xs, ys
+    return pts[:, 0], pts[:, 1]
+
+
 def _best_cluster(m: np.ndarray, min_t: float, square: bool = True) -> _Cluster | None:
     """Find the group of ink that looks most like a seal: large, square, built from big pieces.
 
@@ -197,6 +250,10 @@ def _best_cluster(m: np.ndarray, min_t: float, square: bool = True) -> _Cluster 
             score = area * sq ** (2.0 if square else 0.5) * (0.15 if touches else 1.0)
             if best is None or score > best.score * 1.001:
                 best = _Cluster(score, sq, area / (H * W), touches, t, xs, ys)
+    if best is not None:                               # a dashed or broken border reaches further
+        used = set(np.unique(lab[best.ys, best.xs]).tolist())
+        xs, ys = _extend_outline(lab, st, best.xs, best.ys, used, max(4, H * W * 3e-5))
+        best = replace(best, xs=xs.astype(int), ys=ys.astype(int))
     return best
 
 
@@ -574,6 +631,8 @@ def library_entries() -> list[dict]:
                 continue
             if (d / "image.png").is_file():
                 meta["dir"] = d
+                if not meta.get("saved"):                  # when it was last changed
+                    meta["saved"] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime((d / "seal.json").stat().st_mtime))
                 entries.append(meta)
     entries.sort(key=lambda e: e.get("saved", ""), reverse=True)
     return entries
@@ -1302,6 +1361,39 @@ def scale_build(b: Build, w_mm: float, h_mm: float):
     for p in b.chars:
         p.cx, p.cy, p.scale = p.cx * fx, p.cy * fy, p.scale * min(fx, fy)
     b.w_mm, b.h_mm = w_mm, h_mm
+
+
+SEAL_PIECE_PX = 1600                 # long side of a whole seal placed into a build
+
+
+def seal_piece(entry: dict) -> Placed:
+    """A whole saved seal as one piece of a build, as it prints, at its own size."""
+    job = job_from_library(entry)
+    w, h = job.dims()
+    ink = job.render_long(SEAL_PIECE_PX)
+    return Placed(f"seal-{Path(entry['dir']).name}", entry.get("name") or "seal", ink,
+                  cx=w / 2, cy=h / 2, scale=max(w, h) / max(ink.shape))
+
+
+def copy_name(name: str) -> str:
+    """A name for a copy that no saved seal has yet: "name copy", then "name copy 2" and on."""
+    base = re.sub(r" copy( \d+)?$", "", name.strip())
+    taken = {e.get("name", "") for e in library_entries()}
+    k = 1
+    while (cand := f"{base} copy" + (f" {k}" if k > 1 else "")) in taken:
+        k += 1
+    return cand
+
+
+def seal_as_build(entry: dict) -> Build:
+    """Any saved seal as a build: a plain format of its size holding the seal as one piece, so
+    the build page's tools (the character editor's eraser, lasso, strokes) can change it."""
+    if (Path(entry["dir"]) / "build.json").is_file():
+        return load_build(entry)
+    p = seal_piece(entry)
+    b = Build("rect", round(p.cx * 2, 2), round(p.cy * 2, 2), frame_mm=0.0)
+    b.chars.append(p)
+    return b
 
 
 def save_build(b: Build, name: str, lib_id: str | None = None) -> str:
@@ -3444,7 +3536,23 @@ class Composer(QtWidgets.QWidget):
         self.chk_white = QtWidgets.QCheckBox("White text (invert the whole seal)")
         self.chk_white.setToolTip("Bai wen: the ground becomes ink and the characters are cut out of it")
         lv.addWidget(self.chk_white)
-        lv.addWidget(section_label("Characters"))
+        lv.addWidget(section_label("Add"))
+        sources = QtWidgets.QHBoxLayout()
+        sources.setSpacing(4)
+        self.source = "chars"
+        self.source_buttons = {}
+        for key, label, tip in (("chars", "Characters", "Characters you picked out of saved seals"),
+                                ("seals", "Seals", "Whole saved seals, to build on or combine")):
+            b = QtWidgets.QPushButton(label)
+            b.setCheckable(True)
+            b.setAutoExclusive(True)
+            b.setToolTip(tip)
+            b.clicked.connect(lambda _=False, k=key: self.set_source(k))
+            sources.addWidget(b)
+            self.source_buttons[key] = b
+        self.source_buttons["chars"].setChecked(True)
+        sources.addStretch(1)
+        lv.addLayout(sources)
         self.search = QtWidgets.QLineEdit()
         self.search.setPlaceholderText("Search by character or seal")
         self.search.setClearButtonEnabled(True)
@@ -3460,11 +3568,22 @@ class Composer(QtWidgets.QWidget):
         self.chars.setMinimumHeight(self.char_tile.height() * 2 + 20)
         self.chars.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         lv.addWidget(self.chars, 1)
-        self.chars_empty = muted_label("No characters yet. In the Saved seals tab, select a seal and press "
-                                       "Pick characters… to cut some out.")
-        lv.addWidget(self.chars_empty)
+        self.seals = QtWidgets.QListWidget()
+        self.seals.setObjectName("library")
+        self.seals.setViewMode(QtWidgets.QListView.ViewMode.IconMode)
+        self.seals.setMovement(QtWidgets.QListView.Movement.Static)
+        self.seals.setResizeMode(QtWidgets.QListView.ResizeMode.Adjust)
+        self.seals.setIconSize(QtCore.QSize(56, 56))
+        self.seal_tile = QtCore.QSize(max(84, M * 7), 56 + 2 * fm.height() + 18)
+        self.seals.setGridSize(self.seal_tile + QtCore.QSize(4, 4))
+        self.seals.setMinimumHeight(self.seal_tile.height() * 2 + 20)
+        self.seals.hide()
+        lv.addWidget(self.seals, 1)
+        self.chars_empty = muted_label()
+        self.chars_empty.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+        lv.addWidget(self.chars_empty, 1)                  # takes the list's room while there is no list
         self.btn_add_char = QtWidgets.QPushButton("Add to seal")
-        self.btn_add_char.setToolTip("Or double-click a character")
+        self.btn_add_char.setToolTip("Or double-click it")
         lv.addWidget(self.btn_add_char)
 
         # middle: the seal itself
@@ -3577,8 +3696,10 @@ class Composer(QtWidgets.QWidget):
         self.chk_guides.toggled.connect(self.view.show_guides)
         self.search.textChanged.connect(self.filter_chars)
         self.chars.itemDoubleClicked.connect(lambda _: self.add_selected())
-        self.chars.itemSelectionChanged.connect(
-            lambda: self.btn_add_char.setEnabled(bool(self.chars.selectedItems())))
+        self.seals.itemDoubleClicked.connect(lambda _: self.add_selected())
+        for lst in (self.chars, self.seals):
+            lst.itemSelectionChanged.connect(
+                lambda: self.btn_add_char.setEnabled(bool(self._list().selectedItems())))
         self.chars.customContextMenuRequested.connect(self.char_menu)
         self.btn_add_char.clicked.connect(self.add_selected)
         self.btn_arrange.clicked.connect(self.arrange)
@@ -3599,8 +3720,22 @@ class Composer(QtWidgets.QWidget):
         self.refresh_characters()
         self.on_select()
 
-    # ---- the characters to choose from
+    # ---- the characters and seals to choose from
+    def _list(self) -> QtWidgets.QListWidget:
+        return self.chars if self.source == "chars" else self.seals
+
+    def set_source(self, source: str):
+        self.source = source
+        self.source_buttons[source].setChecked(True)
+        self.search.setPlaceholderText("Search by character or seal" if source == "chars" else "Search seals by name")
+        self.refresh_characters()
+
     def refresh_characters(self):
+        """Fill the list being shown: picked characters, or whole saved seals."""
+        if self.source == "seals":
+            self._refresh_seals()
+            return
+        self.seals.hide()
         self.chars.clear()
         entries = character_entries()
         fm = self.chars.fontMetrics()
@@ -3615,17 +3750,47 @@ class Composer(QtWidgets.QWidget):
             self.chars.addItem(item)
         self.chars.setVisible(bool(entries))
         self.search.setEnabled(bool(entries))
+        self.chars_empty.setText("No characters yet. In the Saved seals tab, select a seal and press "
+                                 "Pick characters… to cut some out.")
+        self.chars_empty.setVisible(not entries)
+        self.btn_add_char.setEnabled(False)
+        self.filter_chars(self.search.text())
+
+    def _refresh_seals(self):
+        self.chars.hide()
+        self.seals.clear()
+        entries = library_entries()
+        fm = self.seals.fontMetrics()
+        for e in entries:
+            name = e.get("name") or e["dir"].name
+            size = fmt_mm(float(e.get("size", 0)))
+            item = QtWidgets.QListWidgetItem(fm.elidedText(name, Qt.TextElideMode.ElideRight, self.seal_tile.width() - 8)
+                                             + "\n" + f"{size} mm")
+            thumb = QtGui.QImage(str(e["dir"] / "thumb.png"))
+            if not thumb.isNull():
+                item.setIcon(seal_icon(thumb, 112))
+            item.setToolTip(f"{name}\n{size} mm" + ("" if e.get("square", True) else " longest"))
+            item.setSizeHint(self.seal_tile)
+            item.setData(Qt.ItemDataRole.UserRole, str(e["dir"]))
+            item.setData(Qt.ItemDataRole.UserRole + 1, name.lower())
+            self.seals.addItem(item)
+        self.seals.setVisible(bool(entries))
+        self.search.setEnabled(bool(entries))
+        self.chars_empty.setText("No saved seals yet.")
         self.chars_empty.setVisible(not entries)
         self.btn_add_char.setEnabled(False)
         self.filter_chars(self.search.text())
 
     def filter_chars(self, text):
         text = text.strip().lower()
-        for i in range(self.chars.count()):
-            item = self.chars.item(i)
+        lst = self._list()
+        for i in range(lst.count()):
+            item = lst.item(i)
             item.setHidden(bool(text) and text not in item.data(Qt.ItemDataRole.UserRole + 1))
 
     def char_menu(self, pos):
+        if self.source != "chars":
+            return
         item = self.chars.itemAt(pos)
         if item is None:
             return
@@ -3640,7 +3805,23 @@ class Composer(QtWidgets.QWidget):
                 self.refresh_characters()
 
     def add_selected(self):
-        for item in self.chars.selectedItems():
+        if self.source == "seals":
+            QtWidgets.QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            try:
+                for item in self.seals.selectedItems():
+                    d = Path(item.data(Qt.ItemDataRole.UserRole))
+                    try:
+                        entry = {**json.loads((d / "seal.json").read_text("utf-8")), "dir": d}
+                        p = seal_piece(entry)
+                    except (OSError, ValueError):
+                        continue
+                    side = 0.9 * min(self.build.w_mm, self.build.h_mm)
+                    p.scale *= side / max(p.cx, p.cy) / 2      # fit it in the middle of the seal
+                    p.cx, p.cy = self.build.w_mm / 2, self.build.h_mm / 2
+                    self.build.chars.append(p)
+            finally:
+                QtWidgets.QApplication.restoreOverrideCursor()
+        for item in (self.chars.selectedItems() if self.source == "chars" else []):
             d = Path(item.data(Qt.ItemDataRole.UserRole))
             try:
                 meta = json.loads((d / "char.json").read_text("utf-8"))
@@ -3883,12 +4064,17 @@ class Composer(QtWidgets.QWidget):
         self.schedule()
 
     def load(self, entry: dict):
-        """Open a seal built earlier so it can be changed."""
-        self.build = load_build(entry)
-        self.lib_id = Path(entry["dir"]).name
+        """Open a copy of a saved seal to change: a built one as it was built, any other as one
+        piece filling its format. Saving makes a new seal; the original stays as it is."""
+        QtWidgets.QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            self.build = seal_as_build(entry)
+        finally:
+            QtWidgets.QApplication.restoreOverrideCursor()
+        self.lib_id = None
         self.auto_layout = False
         self.name_typed = True
-        self.name.setText(entry.get("name", ""))
+        self.name.setText(copy_name(entry.get("name", "") or "seal"))
         b = self.build
         preset = next((i for i, (_, s, w, h) in enumerate(FORMATS) if (s, w, h) == (b.shape, b.w_mm, b.h_mm)),
                       len(FORMATS))
@@ -3945,11 +4131,22 @@ class LibraryDialog(QtWidgets.QDialog):
         v = QtWidgets.QVBoxLayout(saved)
         v.setContentsMargins(10, 12, 10, 10)
         v.setSpacing(10)
+        top = QtWidgets.QHBoxLayout()
         self.search = QtWidgets.QLineEdit()
         self.search.setPlaceholderText("Search by name")
         self.search.setClearButtonEnabled(True)
         self.search.textChanged.connect(self._filter)
-        v.addWidget(self.search)
+        top.addWidget(self.search, 1)
+        top.addWidget(QtWidgets.QLabel("Sort"))
+        self.cmb_sort = QtWidgets.QComboBox()
+        self.cmb_sort.addItem("Last changed first", "new")
+        self.cmb_sort.addItem("First changed first", "old")
+        self.cmb_sort.addItem("Name", "name")
+        self.settings = QtCore.QSettings("sealprint", "sealprint")
+        self.cmb_sort.setCurrentIndex(max(0, self.cmb_sort.findData(self.settings.value("library_sort", "new"))))
+        self.cmb_sort.currentIndexChanged.connect(self._sort_changed)
+        top.addWidget(self.cmb_sort)
+        v.addLayout(top)
         self.grid = QtWidgets.QListWidget()
         self.grid.setObjectName("library")
         self.grid.setViewMode(QtWidgets.QListView.ViewMode.IconMode)
@@ -3960,7 +4157,7 @@ class LibraryDialog(QtWidgets.QDialog):
         self.grid.setIconSize(QtCore.QSize(self.THUMB, self.THUMB))
         fm = self.fontMetrics()
         self.tile = QtCore.QSize(max(self.THUMB + 34, fm.horizontalAdvance("M") * 9),
-                                 self.THUMB + 2 * fm.height() + 24)
+                                 self.THUMB + 3 * fm.height() + 24)
         self.grid.setGridSize(self.tile + QtCore.QSize(8, 8))
         self.grid.itemDoubleClicked.connect(self.accept)
         self.grid.itemSelectionChanged.connect(self._selection)
@@ -3982,7 +4179,8 @@ class LibraryDialog(QtWidgets.QDialog):
         self.btn_pick.setToolTip("Cut single characters out of the selected seal, to build new seals with")
         self.btn_pick.clicked.connect(self._pick_characters)
         self.btn_edit = QtWidgets.QPushButton("Edit build")
-        self.btn_edit.setToolTip("Change a seal you built from characters")
+        self.btn_edit.setToolTip("Open a copy of the selected seal in Build from scratch to change it.\n"
+                                 "Saving makes a new seal; the original stays as it is.")
         self.btn_edit.clicked.connect(self._edit_build)
         cancel = QtWidgets.QPushButton("Cancel")
         cancel.clicked.connect(self.reject)
@@ -4006,9 +4204,18 @@ class LibraryDialog(QtWidgets.QDialog):
         fit_to_screen(self, 1180, 760)
         self._populate()
 
+    def _sort_changed(self, *_):
+        self.settings.setValue("library_sort", self.cmb_sort.currentData())
+        self._populate()
+
     def _populate(self):
         self.grid.clear()
-        entries = library_entries()
+        entries = library_entries()                    # last changed first
+        order = self.cmb_sort.currentData()
+        if order == "old":
+            entries.reverse()
+        elif order == "name":
+            entries.sort(key=lambda e: (e.get("name") or e["dir"].name).lower())
         counts: dict[str, int] = {}
         for c in character_entries():
             counts[c.get("parent_id", "")] = counts.get(c.get("parent_id", ""), 0) + 1
@@ -4018,10 +4225,11 @@ class LibraryDialog(QtWidgets.QDialog):
             size = fmt_mm(float(e.get("size", 0)))
             item = QtWidgets.QListWidgetItem(
                 fm.elidedText(name, Qt.TextElideMode.ElideRight, self.tile.width() - 12) + "\n"
-                + (f"{size} mm" if e.get("square", True) else f"longest {size} mm"))
+                + (f"{size} mm" if e.get("square", True) else f"longest {size} mm") + "\n"
+                + str(e.get("saved", ""))[:10])
             n = counts.get(e["dir"].name, 0)
             built = (e["dir"] / "build.json").is_file()
-            item.setToolTip(f"{name}\nSaved {e.get('saved', '')}" + ("\nBuilt from characters" if built else "")
+            item.setToolTip(f"{name}\nLast changed {e.get('saved', '')}" + ("\nBuilt from characters" if built else "")
                             + (f"\n{plural(n, 'character')} picked from it" if n else ""))
             item.setSizeHint(self.tile)
             item.setData(Qt.ItemDataRole.UserRole, str(e["dir"]))
@@ -4056,7 +4264,7 @@ class LibraryDialog(QtWidgets.QDialog):
         self.btn_add.setEnabled(n > 0)
         self.btn_delete.setEnabled(n > 0)
         self.btn_pick.setEnabled(n == 1)
-        self.btn_edit.setEnabled(n == 1 and (picked[0]["dir"] / "build.json").is_file())
+        self.btn_edit.setEnabled(n == 1)
         self.btn_add.setText("Add to sheet" if n < 2 else f"Add {n} to sheet")
 
     def chosen(self) -> list[dict]:
