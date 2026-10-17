@@ -8,31 +8,34 @@ physical size on A4, ready to transfer onto a seal stone.
 ## What it does
 
 - **Finds the seal by itself.** Rough screenshots are fine: extra margin, captions, a dark image-viewer
-  background, a slight tilt or a chipped border. Switch on Crop manually to draw the seal's area by hand.
-- **Pure black and white.** The PDF holds a lossless 1-bit image at 1200 dpi. Stroke weight and edge
-  smoothing are adjustable, and red seal paste is read separately from black calligraphy around it.
+  background, a slight tilt or a chipped border. If the frame is off, Crop manually lets you draw the
+  seal's area yourself.
+- **Pure black and white.** The PDF holds a lossless 1-bit image at 1200 dpi. Red seal paste is read
+  separately from black calligraphy around it, and stroke weight and edge smoothing are adjustable.
+- **Extra smooth.** For rough impressions: redraws every outline as clean curves, a best guess at the
+  intended strokes. Specks and pinholes go, ragged edges come out straight or evenly curved, and real
+  corners stay sharp.
 - **Square seals and other shapes.** Rectangles, ovals, circles and free-form seals keep their
   proportions and are sized by their longest length.
 - **Many seals on one sheet.** Each seal has its own size and number of copies, and everything is packed
   onto as few A4 pages as possible.
 - **Exact size, even on stubborn printers.** For self-service printers that always shrink pages to fit,
   the Enlarge setting compensates, and Calibrate works out the number from a test print.
-- **Seal library.** Save a seal with its frame and settings, then load it onto any later sheet.
-- **Build new seals from characters.** Cut single characters out of saved seals (with a box, or by
-  drawing an outline around them by hand) and name them, then compose a new seal from them: pick a
-  format (square, rectangles, circle, oval or your own size), a frame thickness, round corners and red
-  or white text. Characters scale with their proportions kept; switch the handles to Squish or Crop to
-  change their proportions or trim their edges. Characters can overlap: the paper around them is
-  see-through. The canvas zooms, and has faint guides through the middle.
-- **Edit characters down to single strokes.** Squish a character horizontally or vertically, change its
-  weight in fine steps, erase parts of it, move parts of it with a lasso, and reshape single strokes:
-  draw along a stroke (or just part of one) to select it, then drag it to stretch or bend it like dough,
-  or lengthen it at its free end.
-- **Nothing is lost.** Every edit (squish, crop, strokes, lengthening, moving, erasing, weight) has an Original switch
-  that shows the character without it, and switching it back brings the edit back.
-- **Extra smooth.** Redraws a rough impression's outlines as clean curves, a best guess at the intended
-  strokes: specks and pinholes go, ragged edges come out straight or evenly curved, corners stay sharp.
 - **Close-up inspection.** Click the black-and-white seal to zoom into the exact pixels that get printed.
+- **Seal library.** Save a seal with its frame and settings, then load it onto any later sheet.
+- **A library of characters.** Cut single characters out of your saved seals, with a box or an outline
+  drawn by hand, and name them. Each one remembers the seal it came from, and you can search by either.
+- **Build new seals.** Compose a seal from your characters: square, rectangle, circle, oval or your own
+  size, with the frame thickness you choose, round corners, and red or white text. Characters are laid
+  out in reading order (columns from right to left), then can be moved, scaled, squished, cropped and
+  overlapped on a canvas that zooms and has guides through the middle. Built seals print and load like
+  any other seal, and stay editable.
+- **Edit characters down to single strokes.** Squish a character horizontally or vertically and set its
+  weight in fine steps. Draw along a stroke, or part of one, to select it, then drag it to stretch or
+  bend it like dough, or lengthen it at its free end. A lasso moves parts of a character, and an eraser
+  removes them.
+- **Nothing is lost.** Every edit (squish, crop, strokes, lengthening, moving, erasing, weight) has an
+  Original switch that shows the character without it; switching it back brings the edit back.
 - **Two-tone themes.** Dark, Ink, Lacquer, Paper, Celadon, Blue and white, or your own two colours.
 
 ## Install
@@ -74,13 +77,14 @@ warning, then go to **System Settings → Privacy & Security**, scroll down to S
 3. Under **This seal**, choose Square or Other shape, the size in mm (the longest length for other
    shapes) and the number of copies. Stroke weight, Smooth edges, Extra smooth and Invert tune the
    black-and-white result. Right-click a seal in the strip to duplicate or remove it.
-4. **Load…** opens the seal library. Under Saved seals, **Pick characters…** lets you drag a box
-   around single characters of the selected seal and name them. **Build from scratch** composes a new
-   seal from those characters; it is saved to the library like any other seal, and **Edit build**
-   reopens it later. The Handles switch under the seal sets what a character's handles do: Scale
-   (keeps its proportions), Squish or Crop. Double-click a character to open its editor: squish,
-   strokes (draw along a stroke to select it, drag the selection to stretch or bend it, right-click to
-   clear it, Ctrl+Z to undo), lengthen the selected stroke, and weight.
+4. **Load…** opens the seal library. Under Saved seals, **Pick characters…** cuts single characters
+   out of the selected seal (drag a box, or switch to Draw to outline one by hand) and names them.
+   **Build from scratch** composes a new seal from them; it is saved to the library like any other
+   seal, and **Edit build** reopens it later. The Handles switch under the seal sets what a
+   character's handles do: Scale (keeps its proportions), Squish or Crop. Double-click a character to
+   open its editor: squish, strokes (draw along a stroke to select it, drag the selection to stretch
+   or bend it, right-click to clear it, Ctrl+Z to undo), lengthen the selected stroke, Lasso to move a
+   part, Eraser, and weight.
 5. Click the black-and-white seal to inspect it up close (scroll or + and − to zoom, click to go back).
 6. **Export PDF…**
 
