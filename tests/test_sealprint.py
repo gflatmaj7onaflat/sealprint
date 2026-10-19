@@ -407,3 +407,29 @@ def test_any_saved_seal_opens_as_a_build_and_saves_as_a_copy(tmp_path, monkeypat
     assert copy_id != sid and sp.copy_name("閒章 copy") == "閒章 copy 2"
     names = sorted(e["name"] for e in sp.library_entries())
     assert names == ["閒章", "閒章 copy"]
+
+
+def test_mixed_red_and_white_text_can_be_unified():
+    ink = np.ones((300, 300), bool)                      # white text (陰文): an ink ground...
+    ink[60:240, 40:60] = False                           # ...with a paper stroke
+    ink[20:280, 180:280] = False                         # and a red-text (朱文) panel on the right
+    ink[60:240, 225:235] = True                          # with an ink stroke
+    zhu = sp.to_zhuwen(ink)
+    assert zhu[150, 50] and zhu[150, 230]                # every stroke is ink now
+    assert not zhu[150, 120] and not zhu[150, 200] and not zhu[5, 5]   # every ground is paper
+    b = sp.Build("rect", 30, 30, frame_mm=0)
+    b.chars = [sp.Placed("m", "mixed", ink, cx=15, cy=15, scale=0.1)]
+    b.text, b.chars[0].unify, b.invert_all = "bai", True, True
+    bai = sp.render_build(b, 10)
+    assert not bai[150, 50] and not bai[150, 230] and bai[150, 120]   # all white text: strokes paper
+
+
+def test_a_frame_shows_whatever_is_inside_it():
+    g = np.ones((200, 200), bool)                        # a piece that is solid ink up to the edge
+    b = sp.Build("rect", 20, 20, frame_mm=1.0)
+    b.chars = [sp.Placed("x", "x", g, cx=10, cy=10, scale=0.1)]
+    ink = sp.render_build(b, 10)                         # 10 px per mm
+    assert ink[100, 2:8].all() and not ink[100, 12:18].any() and ink[100, 25:40].all()
+    b.chars = []                                         # on plain paper: just an ink line
+    ink = sp.render_build(b, 10)
+    assert ink[100, 0:10].all() and not ink[100, 12:40].any()

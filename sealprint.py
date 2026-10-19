@@ -30,7 +30,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import QPointF, QRectF, Qt
 
 APP_NAME = "Seal Print"
-__version__ = "1.6.0"
+__version__ = "1.7.0"
 A4_W, A4_H = 210.0, 297.0           # page size, mm
 PAGE_MARGIN = 10.0                  # mm kept clear at the paper edge
 EXPORT_DPI = 1200                   # resolution of the seal image inside the PDF
@@ -443,6 +443,54 @@ def _outline_corners(pts: np.ndarray, reach: int, min_turn: float) -> list:
     return corners
 
 
+def ink_ground(ink: np.ndarray) -> np.ndarray:
+    """Where a seal is white text (陰文): the parts whose ground, the wide connected area the
+    strokes sit on, is ink rather than paper. Grounds are large areas much wider than any
+    stroke; every other pixel belongs to the ground nearest to it."""
+    H, W = ink.shape
+    grounds = np.zeros((H, W), bool)
+    dark = np.zeros((H, W), bool)
+    widths = []
+    parts = []
+    for colour, conn in ((True, 8), (False, 4)):
+        mask = (ink == colour).astype(np.uint8)
+        n, lab, st, _ = cv2.connectedComponentsWithStats(mask, connectivity=conn)
+        dt = cv2.distanceTransform(mask, cv2.DIST_L2, 5)
+        order = np.argsort(lab.ravel(), kind="stable")    # the widest point of each area
+        starts = np.searchsorted(lab.ravel()[order], np.arange(n))
+        widest = np.maximum.reduceat(dt.ravel()[order], np.minimum(starts, lab.size - 1))
+        for i in range(1, n):
+            parts.append((colour, i, lab, st[i, cv2.CC_STAT_AREA], widest[i]))
+            widths.append(widest[i])
+    if not parts:
+        return dark
+    stroke = float(np.median(widths))                 # a typical stroke's half-width
+    for colour in (True, False):
+        mine = [(i, lab) for c, i, lab, area, widest in parts if c == colour and
+                (area >= 0.15 * H * W or (area >= 0.02 * H * W and widest >= 2.5 * stroke))]
+        if mine:
+            lab = mine[0][1]
+            hit = np.isin(lab, [i for i, _ in mine])
+            grounds |= hit
+            if colour:
+                dark |= hit
+    if not grounds.any():
+        return dark
+    # every pixel takes the colour of the ground nearest to it
+    _, nearest = cv2.distanceTransformWithLabels((~grounds).astype(np.uint8), cv2.DIST_L2, 5,
+                                                 labelType=cv2.DIST_LABEL_PIXEL)
+    ys, xs = np.nonzero(grounds)
+    lookup = np.zeros(nearest.max() + 1, bool)
+    lookup[nearest[ys, xs]] = dark[ys, xs]
+    return lookup[nearest]
+
+
+def to_zhuwen(ink: np.ndarray) -> np.ndarray:
+    """The same seal with every white-text (陰文) part turned into red text (朱文): wherever the
+    ground is ink, ink and paper swap, so every stroke ends up as ink on paper."""
+    return ink ^ ink_ground(ink)
+
+
 def smooth_strokes(ink: np.ndarray, strength: float = 1.0) -> np.ndarray:
     """Redraw the outline of every stroke as clean curves: a best guess at the stroke the ink
     was meant to be. Specks and pinholes go, edges are traced, real corners are found and kept
@@ -805,13 +853,15 @@ class Placed:
     use_lengthen: bool = True
     use_erase: bool = True
     use_move: bool = True
+    unify: bool = False              # any white-text (陰文) parts drawn as red text (朱文)
     invert: bool = False
     z: float = 0.0                   # stacking: higher is on top where characters overlap
     cache: tuple | None = None
 
 
 PLACED_FIELDS = ("glyph_id", "name", "cx", "cy", "scale", "sq_x", "sq_y", "use_squish", "crop", "use_crop",
-                 "weight", "use_weight", "ops", "use_strokes", "use_lengthen", "use_erase", "use_move", "invert", "z")
+                 "weight", "use_weight", "ops", "use_strokes", "use_lengthen", "use_erase", "use_move", "unify",
+                 "invert", "z")
 OP_SWITCH = {"drag": "use_strokes", "lengthen": "use_lengthen", "erase": "use_erase", "move": "use_move"}
 
 
@@ -840,6 +890,7 @@ class Build:
     invert_all: bool = False         # white text (bai wen): ink and paper swapped inside the shape
     chars: list = field(default_factory=list)
     corner_mm: float = 0.0           # rounded corners for rectangles, 0 for square ones
+    text: str = "as"                 # "as" each piece as picked, "zhu" all red text, "bai" all white text
 
 
 EDIT_PAD = 0.35                      # room around a character for strokes to be pulled into
@@ -915,11 +966,13 @@ def process_char(p: Placed) -> tuple[np.ndarray, int, int]:
     where the picture's own pixel (0, 0) falls in that image."""
     ops = active_ops(p)
     crop = tuple(p.crop) if (p.crop is not None and p.use_crop) else None
-    key = (id(p.src), json.dumps(ops, sort_keys=True), p.weight if p.use_weight else 0, crop)
+    key = (id(p.src), json.dumps(ops, sort_keys=True), p.weight if p.use_weight else 0, crop, p.unify)
     if p.cache is not None and p.cache[0] == key:
         return p.cache[1], p.cache[2], p.cache[3]
     pad = edit_pad(p) if ops else 0
     g = edit_canvas(p, ops) if ops else p.src
+    if p.unify:
+        g = to_zhuwen(g)
     if p.use_weight and p.weight:
         g = thicken(g, p.weight, max(p.src.shape), soft=True)    # edges kept to a fraction of a pixel
     if crop is not None:
@@ -1271,6 +1324,14 @@ def shape_inside(b: Build, W: int, H: int, px_per_mm: float) -> np.ndarray:
     return np.ones((H, W), bool)
 
 
+def _band(b: Build, W: int, H: int, a: float, c: float, px_per_mm: float) -> np.ndarray:
+    """The part of the seal's shape between a and c pixels in from its edge."""
+    if b.shape == "ellipse":
+        return _ellipse(W, H, W / 2 - a, H / 2 - a) & ~_ellipse(W, H, W / 2 - c, H / 2 - c)
+    R = b.corner_mm * px_per_mm
+    return _rounded(W, H, a, R) & ~_rounded(W, H, c, R)
+
+
 def render_build(b: Build, px_per_mm: float) -> np.ndarray:
     """The built seal as a bool image (True = black)."""
     W, H = max(8, round(b.w_mm * px_per_mm)), max(8, round(b.h_mm * px_per_mm))
@@ -1280,37 +1341,33 @@ def render_build(b: Build, px_per_mm: float) -> np.ndarray:
         x, y, w, h = char_rect(p)
         gw, gh = max(1, round(w * px_per_mm)), max(1, round(h * px_per_mm))
         g = fit_glyph(img, gw, gh)
-        if p.invert:
+        solid = p.invert and not p.unify
+        if solid:
             g = ~g
         x0, y0 = round(x * px_per_mm), round(y * px_per_mm)
         dx0, dy0, dx1, dy1 = max(0, x0), max(0, y0), min(W, x0 + gw), min(H, y0 + gh)
         if dx1 <= dx0 or dy1 <= dy0:
             continue
         part = g[dy0 - y0:dy1 - y0, dx0 - x0:dx1 - x0]
-        if p.invert:
+        if solid:
             ink[dy0:dy1, dx0:dx1] = part
         else:
             ink[dy0:dy1, dx0:dx1] |= part
+    inside = shape_inside(b, W, H, px_per_mm)
+    final = (~ink & inside) if b.invert_all else (ink & inside)
     t = b.frame_mm * px_per_mm
-    o = t if b.invert_all else 0.0       # white text: the frame becomes a white line set in from a solid rim
-    if b.shape == "ellipse":
-        inside = _ellipse(W, H, W / 2, H / 2)
-        if t > 0:
-            ink |= _ellipse(W, H, W / 2 - o, H / 2 - o) & ~_ellipse(W, H, W / 2 - o - t, H / 2 - o - t)
-    elif b.corner_mm > 0:
-        R = b.corner_mm * px_per_mm
-        inside = _rounded(W, H, 0, R)
-        if t > 0:
-            ink |= _rounded(W, H, o, R) & ~_rounded(W, H, o + t, R)
-    else:
-        inside = np.ones((H, W), bool)
-        if t > 0:
-            a, k = round(o), max(1, round(t))
-            band = np.zeros((H, W), bool)
-            band[a:H - a, a:W - a] = True
-            band[a + k:H - a - k, a + k:W - a - k] = False
-            ink |= band
-    return (~ink & inside) if b.invert_all else (ink & inside)
+    if t > 0:
+        # A frame has to show against what is just inside it: on paper it is an ink line along
+        # the edge; where the ground inside is ink, a paper line just inside an ink rim.
+        rim, line = _band(b, W, H, 0, t, px_per_mm), _band(b, W, H, t, 2 * t, px_per_mm)
+        probe = _band(b, W, H, 2 * t, 2 * t + max(3 * t, 0.04 * min(W, H)), px_per_mm)
+        k = max(3, int(round(6 * t)) | 1)
+        near = cv2.blur((final & probe).astype(np.float32), (k, k))
+        seen = cv2.blur(probe.astype(np.float32), (k, k))
+        dark = near > 0.5 * seen
+        final |= rim
+        final &= ~(line & dark)
+    return final
 
 
 def fit_into(p: Placed, x: float, y: float, w: float, h: float):
@@ -1328,7 +1385,7 @@ def auto_arrange(b: Build):
     n = len(b.chars)
     if not n:
         return
-    edge = b.frame_mm * (2 if b.invert_all else 1) + 0.06 * min(b.w_mm, b.h_mm)
+    edge = b.frame_mm * (2 if (b.invert_all or b.text == "bai") else 1) + 0.06 * min(b.w_mm, b.h_mm)
     aw, ah = max(1.0, b.w_mm - 2 * edge), max(1.0, b.h_mm - 2 * edge)
     if b.shape == "ellipse":                         # the largest rectangle inside the oval
         aw, ah = aw / math.sqrt(2), ah / math.sqrt(2)
@@ -1409,7 +1466,7 @@ def save_build(b: Build, name: str, lib_id: str | None = None) -> str:
     save_to_library(job, name)
     d = LIBRARY / job.lib_id
     layout = {"version": 3, "shape": b.shape, "w_mm": b.w_mm, "h_mm": b.h_mm, "frame_mm": b.frame_mm,
-              "invert_all": b.invert_all, "corner_mm": b.corner_mm,
+              "invert_all": b.invert_all, "corner_mm": b.corner_mm, "text": b.text,
               "chars": [{k: getattr(p, k) for k in PLACED_FIELDS} for p in b.chars]}
     (d / "build.json").write_text(json.dumps(layout, ensure_ascii=False, indent=1), "utf-8")
     gd = d / "glyphs"                                # its own copy of each character's picture
@@ -1441,7 +1498,7 @@ def load_build(entry: dict) -> Build:
     d = Path(entry["dir"])
     data = json.loads((d / "build.json").read_text("utf-8"))
     b = Build(data["shape"], data["w_mm"], data["h_mm"], data["frame_mm"], data["invert_all"],
-              corner_mm=float(data.get("corner_mm", 0.0)))
+              corner_mm=float(data.get("corner_mm", 0.0)), text=data.get("text", "as"))
     for c in data["chars"]:
         g = png_to_ink(d / "glyphs" / f"{c['glyph_id']}.png")
         if data.get("version", 1) < 2:
@@ -2585,7 +2642,7 @@ class CharBox(QtWidgets.QGraphicsRectItem):
         x, y, w, h = char_rect(self.p)
         if not (x <= pos.x() <= x + w and y <= pos.y() <= y + h):
             return False
-        if self.p.invert:                             # an inverted character is solid
+        if self.p.invert and not self.p.unify:        # an inverted character is solid
             return True
         img = process_char(self.p)[0]
         Hi, Wi = img.shape
@@ -3498,6 +3555,7 @@ class Composer(QtWidgets.QWidget):
         self.name_typed = False
         self.boxes: list[CharBox] = []
         self.mode = "scale"                    # what the handles do: scale, squish or crop
+        self.invert_as_picked = False          # Invert the whole seal, while the text is as picked
         self._loading = False
         self.timer = QtCore.QTimer(self)
         self.timer.setSingleShot(True)
@@ -3533,8 +3591,25 @@ class Composer(QtWidgets.QWidget):
                          ("Height", self.spn_h), ("Frame", self.spn_frame), ("Corners", corners)):
             f.addRow(label, w)
         lv.addLayout(f)
-        self.chk_white = QtWidgets.QCheckBox("White text (invert the whole seal)")
-        self.chk_white.setToolTip("Bai wen: the ground becomes ink and the characters are cut out of it")
+        texts = QtWidgets.QHBoxLayout()
+        texts.setSpacing(4)
+        texts.addWidget(QtWidgets.QLabel("Text"))
+        self.text_buttons = {}
+        for key, label, tip in (("as", "As picked", "Every piece as it is: red text (朱文) or white text (陰文)"),
+                                ("zhu", "All 朱文", "Every stroke ink on paper: white-text parts are turned into red text"),
+                                ("bai", "All 陰文", "Every stroke paper on ink: red-text parts are turned into white text")):
+            b = QtWidgets.QPushButton(label)
+            b.setCheckable(True)
+            b.setAutoExclusive(True)
+            b.setToolTip(tip)
+            b.clicked.connect(lambda _=False, k=key: self.set_text(k))
+            texts.addWidget(b)
+            self.text_buttons[key] = b
+        self.text_buttons["as"].setChecked(True)
+        texts.addStretch(1)
+        lv.addLayout(texts)
+        self.chk_white = QtWidgets.QCheckBox("Invert the whole seal")
+        self.chk_white.setToolTip("Swap ink and paper everywhere, so red text becomes white text and back")
         lv.addWidget(self.chk_white)
         lv.addWidget(section_label("Add"))
         sources = QtWidgets.QHBoxLayout()
@@ -3818,6 +3893,7 @@ class Composer(QtWidgets.QWidget):
                     side = 0.9 * min(self.build.w_mm, self.build.h_mm)
                     p.scale *= side / max(p.cx, p.cy) / 2      # fit it in the middle of the seal
                     p.cx, p.cy = self.build.w_mm / 2, self.build.h_mm / 2
+                    p.unify = self.build.text != "as"
                     self.build.chars.append(p)
             finally:
                 QtWidgets.QApplication.restoreOverrideCursor()
@@ -3829,7 +3905,8 @@ class Composer(QtWidgets.QWidget):
             except (OSError, ValueError):
                 continue
             p = Placed(d.name, meta.get("name", ""), src, cx=self.build.w_mm / 2, cy=self.build.h_mm / 2,
-                       scale=0.45 * min(self.build.w_mm, self.build.h_mm) / max(src.shape))
+                       scale=0.45 * min(self.build.w_mm, self.build.h_mm) / max(src.shape),
+                       unify=self.build.text != "as")
             self.build.chars.append(p)
         if self.auto_layout:
             auto_arrange(self.build)
@@ -3884,11 +3961,27 @@ class Composer(QtWidgets.QWidget):
         self.sync_boxes()
         self.schedule()
 
+    def set_text(self, text: str):
+        """As picked, all red text (朱文), or all white text (陰文), for every piece."""
+        if self.build.text == "as":
+            self.invert_as_picked = self.chk_white.isChecked()     # the setting of its own to come back to
+        self.build.text = text
+        self.text_buttons[text].setChecked(True)
+        for p in self.build.chars:
+            p.unify = text != "as"
+            p.cache = None
+        self._loading = True
+        self.chk_white.setChecked(self.invert_as_picked if text == "as" else text == "bai")
+        self.chk_white.setEnabled(text == "as")
+        self._loading = False
+        self.on_style()
+        self.sync_boxes()
+
     def on_style(self, *_):
         if self._loading:
             return
         self.build.frame_mm = self.spn_frame.value()
-        self.build.invert_all = self.chk_white.isChecked()
+        self.build.invert_all = self.chk_white.isChecked() if self.build.text == "as" else self.build.text == "bai"
         if self.auto_layout:
             auto_arrange(self.build)
             self.sync_boxes()
@@ -4055,7 +4148,7 @@ class Composer(QtWidgets.QWidget):
     # ---- starting over, editing, saving
     def clear(self):
         keep = (self.build.shape, self.build.w_mm, self.build.h_mm, self.build.frame_mm, self.build.invert_all)
-        self.build = Build(*keep, corner_mm=self.build.corner_mm)
+        self.build = Build(*keep, corner_mm=self.build.corner_mm, text=self.build.text)
         self.lib_id = None
         self.auto_layout = True
         self.name_typed = False
@@ -4085,6 +4178,9 @@ class Composer(QtWidgets.QWidget):
         self.spn_h.setValue(b.h_mm)
         self.spn_frame.setValue(b.frame_mm)
         self.chk_white.setChecked(b.invert_all)
+        self.invert_as_picked = b.invert_all if b.text == "as" else False
+        self.text_buttons[b.text].setChecked(True)
+        self.chk_white.setEnabled(b.text == "as")
         self.chk_round.setChecked(b.corner_mm > 0)
         if b.corner_mm > 0:
             self.spn_corner.setValue(b.corner_mm)

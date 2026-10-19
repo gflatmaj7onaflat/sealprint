@@ -27,10 +27,11 @@ physical size on A4, ready to transfer onto a seal stone.
 - **A library of characters.** Cut single characters out of your saved seals, with a box or an outline
   drawn by hand, and name them. Each one remembers the seal it came from, and you can search by either.
 - **Build new seals.** Compose a seal from your characters, or from whole saved seals: square, rectangle,
-  circle, oval or your own size, with the frame thickness you choose, round corners, and red or white
-  text. Characters are laid out in reading order (columns from right to left), then can be moved,
-  scaled, squished, cropped and overlapped on a canvas that zooms and has guides through the middle.
-  Built seals print and load like any other seal.
+  circle, oval or your own size, with the frame thickness you choose and round corners. A seal that
+  mixes red text (朱文) and white text (陰文) can be turned all 朱文 or all 陰文 in one click, and a frame
+  always shows, whether the ground inside it is paper or ink. Characters are laid out in reading order
+  (columns from right to left), then can be moved, scaled, squished, cropped and overlapped on a
+  canvas that zooms and has guides through the middle. Built seals print and load like any other seal.
 - **Change any seal, safely.** Edit build opens a copy of any saved seal, built or scanned, with all the
   build and editing tools. Saving makes a new seal; the original stays as it is.
 - **Edit characters down to single strokes.** Squish a character horizontally or vertically and set its
@@ -84,11 +85,12 @@ warning, then go to **System Settings → Privacy & Security**, scroll down to S
    out of the selected seal (drag a box, or switch to Draw to outline one by hand) and names them,
    and **Edit build** opens a copy of the selected seal to change. **Build from scratch** composes a
    new seal from your characters or whole saved seals (the Characters / Seals switch under Add); it
-   is saved to the library like any other seal. The Handles switch under the seal sets what a
-   character's handles do: Scale (keeps its proportions), Squish or Crop. Double-click a character to
-   open its editor: squish, strokes (draw along a stroke to select it, drag the selection to stretch
-   or bend it, right-click to clear it, Ctrl+Z to undo), lengthen the selected stroke, Lasso to move a
-   part, Eraser, and weight.
+   is saved to the library like any other seal. Text (under Format) keeps each piece as picked or
+   makes everything 朱文 or 陰文. The Handles switch under the seal sets what a character's handles
+   do: Scale (keeps its proportions), Squish or Crop. Double-click a character to open its editor:
+   squish, strokes (draw along a stroke to select it, drag the selection to stretch or bend it,
+   right-click to clear it, Ctrl+Z to undo), lengthen the selected stroke, Lasso to move a part,
+   Eraser, and weight.
 5. Click the black-and-white seal to inspect it up close (scroll or + and − to zoom, click to go back).
 6. **Export PDF…**
 
