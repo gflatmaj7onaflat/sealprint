@@ -30,7 +30,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import QPointF, QRectF, Qt
 
 APP_NAME = "Seal Print"
-__version__ = "1.7.0"
+__version__ = "1.8.0"
 A4_W, A4_H = 210.0, 297.0           # page size, mm
 PAGE_MARGIN = 10.0                  # mm kept clear at the paper edge
 EXPORT_DPI = 1200                   # resolution of the seal image inside the PDF
@@ -891,6 +891,7 @@ class Build:
     chars: list = field(default_factory=list)
     corner_mm: float = 0.0           # rounded corners for rectangles, 0 for square ones
     text: str = "as"                 # "as" each piece as picked, "zhu" all red text, "bai" all white text
+    smooth: bool = False             # extra smooth: outlines redrawn as clean curves
 
 
 EDIT_PAD = 0.35                      # room around a character for strokes to be pulled into
@@ -1089,27 +1090,19 @@ def select_stroke(ink: np.ndarray, path) -> tuple[np.ndarray, np.ndarray] | None
 class StrokeDrag:
     """Pull or bend a selected stroke like dough. The grabbed point follows the mouse, the end
     of the selection farthest from it stays where it is, and the part in between follows
-    smoothly, so pulling along the stroke lengthens it and pulling sideways bends it."""
+    smoothly, so pulling along the stroke stretches it and pulling sideways bends it. Only the
+    stroke's centreline moves; the stroke is then redrawn around it with its own cross-section,
+    square to wherever the line now runs, so it keeps its thickness however it is bent."""
 
     def __init__(self, ink: np.ndarray, sel: np.ndarray, centre: np.ndarray, grab, reach: float | None = None):
         self.ink, self.sel = ink, sel
-        c = _resample(centre, max(1.0, float(np.hypot(*np.diff(centre, axis=0).T).sum()) / 80))
+        length = float(np.hypot(*np.diff(centre, axis=0).T).sum())
+        c = _resample(centre, max(1.5, length / 60))
         s = np.r_[0.0, np.cumsum(np.hypot(*np.diff(c, axis=0).T))]
         self.c, self.s, self.L = c, s, max(float(s[-1]), 1e-6)
         self.tg = float(_nearest_param(c, s, np.asarray(grab, np.float64).reshape(1, 2))[0])
         self.from_start = self.tg >= self.L / 2       # anchored at the end farther from the grab
-        H, W = ink.shape
-        ys, xs = np.nonzero(sel)
-        if reach is None:
-            reach = 0.45 * max(H, W)                  # the most a drag can move anything
-        x0, x1 = max(0, int(xs.min() - reach)), min(W, int(xs.max() + reach) + 1)
-        y0, y1 = max(0, int(ys.min() - reach)), min(H, int(ys.max() + reach) + 1)
-        self.box = (x0, y0, x1, y1)
-        step = 4                                      # how far along the stroke each pixel is, on a coarse grid
-        gx, gy = np.meshgrid(np.arange(x0, x1, step, dtype=np.float64), np.arange(y0, y1, step, dtype=np.float64))
-        T = _nearest_param(c, s, np.column_stack([gx.ravel(), gy.ravel()])).reshape(gx.shape)
-        self.T = cv2.resize(T, (x1 - x0, y1 - y0), interpolation=cv2.INTER_LINEAR)
-        self.X, self.Y = np.meshgrid(np.arange(x0, x1, dtype=np.float32), np.arange(y0, y1, dtype=np.float32))
+        self.hw = _half_width(sel, c)
         self.sel_f = sel.astype(np.float32)
 
     def weight(self, t):
@@ -1119,23 +1112,46 @@ class StrokeDrag:
             u = np.clip((self.L - t) / max(self.L - self.tg, 1e-6), 0.0, 1.0)
         return u * u * (3.0 - 2.0 * u)                # smooth at both ends of the bend
 
+    def _with_ends(self, poly: np.ndarray, ext: float) -> np.ndarray:
+        """The centreline carried on straight past both ends, so the stroke's ends come along."""
+        k = min(4, len(poly) - 1)
+        t0 = (poly[0] - poly[k]) / max(float(np.hypot(*(poly[0] - poly[k]))), 1e-9)
+        t1 = (poly[-1] - poly[-1 - k]) / max(float(np.hypot(*(poly[-1] - poly[-1 - k]))), 1e-9)
+        return np.vstack([poly[0] + t0 * ext, poly, poly[-1] + t1 * ext])
+
     def apply(self, d) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """The character with the stroke dragged by d pixels: (ink, selection, centreline)."""
         dx, dy = float(d[0]), float(d[1])
-        x0, y0, x1, y1 = self.box
-        w = self.weight(self.T)
-        xs, ys = self.X - dx * w, self.Y - dy * w
-        for _ in range(5):                            # find where each pixel came from
-            t = cv2.remap(self.T, xs - x0, ys - y0, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
-            w = self.weight(t)
-            xs, ys = self.X - dx * w, self.Y - dy * w
-        moved = cv2.remap(self.sel_f, xs, ys, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT,
-                          borderValue=0) >= 0.5
-        ink = self.ink & ~self.sel
-        ink[y0:y1, x0:x1] |= moved
-        sel = np.zeros_like(self.sel)
-        sel[y0:y1, x0:x1] = moved
-        return ink, sel, self.c + np.outer(self.weight(self.s), (dx, dy))
+        new = self.c + np.outer(self.weight(self.s), (dx, dy))      # the centreline moves like dough
+        H, W = self.ink.shape
+        ext = 2 * self.hw + 3
+        old_e, new_e = self._with_ends(self.c, ext), self._with_ends(new, ext)
+        anchor = 0 if self.from_start else -1                     # the end that stays put stays exactly put
+        new_e[anchor] = old_e[anchor]
+        reach = int(math.ceil(2.2 * self.hw + 4))
+        x0, y0 = (max(0, int(v) - reach) for v in np.floor(new_e.min(0)))
+        x1, y1 = (min(m, int(v) + reach + 1) for v, m in zip(np.ceil(new_e.max(0)), (W, H)))
+        moved = np.zeros((H, W), bool)
+        if x1 > x0 and y1 > y0:
+            near = np.zeros((y1 - y0, x1 - x0), np.uint8)       # only pixels near the new line can be ink
+            cv2.polylines(near, [np.round(new_e - (x0, y0)).astype(np.int32).reshape(-1, 1, 2)], False, 1,
+                          2 * reach + 1)
+            ys, xs = np.nonzero(near)
+            S, N = _project_near(new_e, xs, ys, x0, y0, x1 - x0, y1 - y0)
+            s_new, _ = _poly(new_e)                   # the same place along the old line, segment by segment
+            j = np.clip(np.searchsorted(s_new, S, side="right") - 1, 0, len(new_e) - 2)
+            frac = (S - s_new[j]) / np.maximum(s_new[j + 1] - s_new[j], 1e-9)
+            seg = old_e[j + 1] - old_e[j]
+            unit = seg / np.maximum(np.hypot(seg[:, 0], seg[:, 1]), 1e-9)[:, None]
+            src = (old_e[j] + frac[:, None] * seg + N[:, None] * np.column_stack([-unit[:, 1], unit[:, 0]]))
+            src = src.astype(np.float32)
+            n = len(src)                              # remap takes at most 32767 columns: fold into rows
+            rows = max(1, -(-n // 4096))
+            fold = lambda v: np.pad(v, (0, rows * 4096 - n), constant_values=-10).reshape(rows, 4096)
+            vals = cv2.remap(self.sel_f, fold(src[:, 0]), fold(src[:, 1]), cv2.INTER_LINEAR,
+                             borderMode=cv2.BORDER_CONSTANT, borderValue=0).ravel()[:n]
+            moved[ys + y0, xs + x0] = vals >= 0.5
+        return (self.ink & ~self.sel) | moved, moved, new
 
 
 def fit_glyph(g: np.ndarray, gw: int, gh: int) -> np.ndarray:
@@ -1193,6 +1209,41 @@ def _project(c: np.ndarray, P: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         r = np.arange(len(j))
         S[i:i + 4096] = s_c[j] + t[r, j] * np.sqrt(L2[j])
         N[i:i + 4096] = ((q[:, 0, :] - proj[r, j]) * normal[j]).sum(1)
+    return S, N
+
+
+def _project_near(c: np.ndarray, xs: np.ndarray, ys: np.ndarray, x0: int, y0: int, w: int, h: int):
+    """Like _project for pixels (xs, ys) of a w x h window at (x0, y0), but fast: the polyline's
+    segments are drawn into the window by number, a distance transform tells each pixel its
+    nearest segment, and only that one and its neighbours are measured exactly."""
+    segs = len(c) - 1
+    drawn = np.zeros((h, w), np.int32)
+    pts = np.round(c - (x0, y0)).astype(np.int32)
+    for j in range(segs):                              # later segments overwrite at the joints; fine
+        cv2.line(drawn, tuple(int(v) for v in pts[j]), tuple(int(v) for v in pts[j + 1]), j + 1, 1)
+    if not drawn.any():
+        return _project(c, np.column_stack([xs + x0, ys + y0]).astype(np.float64))
+    _, nearest = cv2.distanceTransformWithLabels((drawn == 0).astype(np.uint8), cv2.DIST_L2, 5,
+                                                 labelType=cv2.DIST_LABEL_PIXEL)
+    dy, dx = np.nonzero(drawn)
+    lookup = np.zeros(nearest.max() + 1, np.int64)
+    lookup[nearest[dy, dx]] = drawn[dy, dx] - 1
+    j0 = lookup[nearest[ys, xs]]
+    s_c, u_c = _poly(c)
+    P = np.column_stack([xs + x0, ys + y0]).astype(np.float64)
+    best_d = np.full(len(P), np.inf)
+    S, N = np.zeros(len(P)), np.zeros(len(P))
+    for off in (-1, 0, 1):                             # the nearest drawn segment and its neighbours
+        j = np.clip(j0 + off, 0, segs - 1)
+        A, AB = c[j], c[j + 1] - c[j]
+        L2 = (AB ** 2).sum(1) + 1e-9
+        t = np.clip(((P - A) * AB).sum(1) / L2, 0.0, 1.0)
+        proj = A + t[:, None] * AB
+        dd = ((P - proj) ** 2).sum(1)
+        better = dd < best_d
+        best_d = np.where(better, dd, best_d)
+        S = np.where(better, s_c[j] + t * np.sqrt(L2), S)
+        N = np.where(better, ((P - proj) * np.column_stack([-u_c[j, 1], u_c[j, 0]])).sum(1), N)
     return S, N
 
 
@@ -1295,7 +1346,7 @@ def lengthen_stroke(ink: np.ndarray, sel: np.ndarray, centre: np.ndarray, amount
     reach = int(math.ceil(2.2 * hw + 4))
     cv2.polylines(near, [np.round(new - (x0, y0)).astype(np.int32).reshape(-1, 1, 2)], False, 1, 2 * reach + 1)
     ys, xs = np.nonzero(near)
-    S_new, N = _project(new, np.column_stack([xs + x0, ys + y0]).astype(np.float64))
+    S_new, N = _project_near(new, xs, ys, x0, y0, x1 - x0, y1 - y0)
     S_old = np.where(S_new <= si, S_new, np.where(S_new <= si + dL, si, S_new - dL))
     s_old, u_old = _poly(old)
     pts, tang = _point_at(old, s_old, u_old, S_old)
@@ -1332,8 +1383,9 @@ def _band(b: Build, W: int, H: int, a: float, c: float, px_per_mm: float) -> np.
     return _rounded(W, H, a, R) & ~_rounded(W, H, c, R)
 
 
-def render_build(b: Build, px_per_mm: float) -> np.ndarray:
-    """The built seal as a bool image (True = black)."""
+def render_build(b: Build, px_per_mm: float, smooth: bool | None = None) -> np.ndarray:
+    """The built seal as a bool image (True = black). smooth overrides the build's own Extra
+    smooth setting (the canvas skips it while things are being dragged around)."""
     W, H = max(8, round(b.w_mm * px_per_mm)), max(8, round(b.h_mm * px_per_mm))
     ink = np.zeros((H, W), bool)
     for p in sorted(b.chars, key=lambda q: q.z):     # later ones on top; paper is see-through
@@ -1355,6 +1407,8 @@ def render_build(b: Build, px_per_mm: float) -> np.ndarray:
             ink[dy0:dy1, dx0:dx1] |= part
     inside = shape_inside(b, W, H, px_per_mm)
     final = (~ink & inside) if b.invert_all else (ink & inside)
+    if b.smooth if smooth is None else smooth:          # before the frame, which stays exact
+        final = smooth_strokes(final) & inside
     t = b.frame_mm * px_per_mm
     if t > 0:
         # A frame has to show against what is just inside it: on paper it is an ink line along
@@ -1466,7 +1520,7 @@ def save_build(b: Build, name: str, lib_id: str | None = None) -> str:
     save_to_library(job, name)
     d = LIBRARY / job.lib_id
     layout = {"version": 3, "shape": b.shape, "w_mm": b.w_mm, "h_mm": b.h_mm, "frame_mm": b.frame_mm,
-              "invert_all": b.invert_all, "corner_mm": b.corner_mm, "text": b.text,
+              "invert_all": b.invert_all, "corner_mm": b.corner_mm, "text": b.text, "smooth": b.smooth,
               "chars": [{k: getattr(p, k) for k in PLACED_FIELDS} for p in b.chars]}
     (d / "build.json").write_text(json.dumps(layout, ensure_ascii=False, indent=1), "utf-8")
     gd = d / "glyphs"                                # its own copy of each character's picture
@@ -1498,7 +1552,8 @@ def load_build(entry: dict) -> Build:
     d = Path(entry["dir"])
     data = json.loads((d / "build.json").read_text("utf-8"))
     b = Build(data["shape"], data["w_mm"], data["h_mm"], data["frame_mm"], data["invert_all"],
-              corner_mm=float(data.get("corner_mm", 0.0)), text=data.get("text", "as"))
+              corner_mm=float(data.get("corner_mm", 0.0)), text=data.get("text", "as"),
+              smooth=bool(data.get("smooth", False)))
     for c in data["chars"]:
         g = png_to_ink(d / "glyphs" / f"{c['glyph_id']}.png")
         if data.get("version", 1) < 2:
@@ -3561,11 +3616,15 @@ class Composer(QtWidgets.QWidget):
         self.timer.setSingleShot(True)
         self.timer.setInterval(20)
         self.timer.timeout.connect(self.render)
+        self.polish = QtCore.QTimer(self)             # the smoothed picture, once things stop moving
+        self.polish.setSingleShot(True)
+        self.polish.setInterval(350)
+        self.polish.timeout.connect(lambda: self.render(smooth=True))
         fm = self.fontMetrics()
         M = fm.horizontalAdvance("M")
 
         # left: format, then the characters to choose from
-        left, lv = side_panel(max(250, M * 20))
+        left, lv = side_panel(max(280, M * 22))
         lv.addWidget(section_label("Format"))
         f = QtWidgets.QFormLayout()
         f.setHorizontalSpacing(10)
@@ -3611,6 +3670,11 @@ class Composer(QtWidgets.QWidget):
         self.chk_white = QtWidgets.QCheckBox("Invert the whole seal")
         self.chk_white.setToolTip("Swap ink and paper everywhere, so red text becomes white text and back")
         lv.addWidget(self.chk_white)
+        self.chk_smooth = QtWidgets.QCheckBox("Extra smooth")
+        self.chk_smooth.setToolTip("Redraws every outline as clean curves, a best guess at the intended strokes:\n"
+                                   "straight edges come out straight and curves even, specks, pinholes and\n"
+                                   "ragged edges disappear, and real corners stay sharp")
+        lv.addWidget(self.chk_smooth)
         lv.addWidget(section_label("Add"))
         sources = QtWidgets.QHBoxLayout()
         sources.setSpacing(4)
@@ -3766,6 +3830,7 @@ class Composer(QtWidgets.QWidget):
             w.valueChanged.connect(self.on_custom)
         self.spn_frame.valueChanged.connect(self.on_style)
         self.chk_white.toggled.connect(self.on_style)
+        self.chk_smooth.toggled.connect(self.on_smooth)
         self.chk_round.toggled.connect(self.on_corners)
         self.spn_corner.valueChanged.connect(self.on_corners)
         self.chk_guides.toggled.connect(self.view.show_guides)
@@ -3780,7 +3845,7 @@ class Composer(QtWidgets.QWidget):
         self.btn_arrange.clicked.connect(self.arrange)
         self.btn_remove.clicked.connect(self.remove_selected)
         self.btn_clear.clicked.connect(self.clear)
-        self.view.scene().selectionChanged.connect(self.on_select)
+        self.view.scene().selectionChanged.connect(self._selection_changed)
         for w in (self.spn_cw, self.spn_ch):
             w.valueChanged.connect(self.on_char_edit)
         self.orig_squish.toggled.connect(self.on_originals)
@@ -4011,10 +4076,19 @@ class Composer(QtWidgets.QWidget):
             self.boxes[select].setSelected(True)
         self.on_select()
 
+    def _selection_changed(self):
+        try:
+            self.on_select()
+        except RuntimeError:                           # the canvas is being closed: nothing to show
+            pass
+
     def selected(self) -> CharBox | None:
-        for b in self.boxes:
-            if b.isSelected():
-                return b
+        try:
+            for b in self.boxes:
+                if b.isSelected():
+                    return b
+        except RuntimeError:                           # the canvas is being closed
+            pass
         return None
 
     def box_changed(self, box: CharBox):
@@ -4129,15 +4203,24 @@ class Composer(QtWidgets.QWidget):
         if not self.name_typed:
             self.name.setText("".join(p.name for p in self.build.chars))
 
+    def on_smooth(self, on: bool):
+        if self._loading:
+            return
+        self.build.smooth = on
+        self.schedule()
+
     def schedule(self):
         self.timer.start()
 
-    def render(self):
-        """Draw the seal at the resolution the canvas is zoomed to, see-through outside its shape."""
+    def render(self, smooth: bool = False):
+        """Draw the seal at the resolution the canvas is zoomed to, see-through outside its shape.
+        Extra smooth takes a moment, so it is drawn only once things have stopped moving."""
         b = self.build
         zoom = self.view.transform().m11() * self.view.devicePixelRatioF()
         k = min(60.0, max(640.0 / max(b.w_mm, b.h_mm), zoom))
-        ink = render_build(b, k)
+        if b.smooth and not smooth:
+            self.polish.start()
+        ink = render_build(b, k, smooth=smooth and b.smooth)
         H, W = ink.shape
         rgba = np.empty((H, W, 4), np.uint8)
         rgba[..., :3] = np.where(ink, 0, 255)[..., None]
@@ -4148,7 +4231,7 @@ class Composer(QtWidgets.QWidget):
     # ---- starting over, editing, saving
     def clear(self):
         keep = (self.build.shape, self.build.w_mm, self.build.h_mm, self.build.frame_mm, self.build.invert_all)
-        self.build = Build(*keep, corner_mm=self.build.corner_mm, text=self.build.text)
+        self.build = Build(*keep, corner_mm=self.build.corner_mm, text=self.build.text, smooth=self.build.smooth)
         self.lib_id = None
         self.auto_layout = True
         self.name_typed = False
@@ -4181,6 +4264,7 @@ class Composer(QtWidgets.QWidget):
         self.invert_as_picked = b.invert_all if b.text == "as" else False
         self.text_buttons[b.text].setChecked(True)
         self.chk_white.setEnabled(b.text == "as")
+        self.chk_smooth.setChecked(b.smooth)
         self.chk_round.setChecked(b.corner_mm > 0)
         if b.corner_mm > 0:
             self.spn_corner.setValue(b.corner_mm)

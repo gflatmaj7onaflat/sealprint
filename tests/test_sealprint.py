@@ -433,3 +433,32 @@ def test_a_frame_shows_whatever_is_inside_it():
     b.chars = []                                         # on plain paper: just an ink line
     ink = sp.render_build(b, 10)
     assert ink[100, 0:10].all() and not ink[100, 12:40].any()
+
+
+def test_bending_a_stroke_keeps_its_thickness():
+    g = plus_padded()                                    # a 20 px bar
+    sel, centre = sp.select_stroke(g, np.column_stack([np.linspace(205, 276, 40), np.full(40, 180.0)]))
+    for d in ((0, 60), (0, 100), (40, 60)):
+        _, part, _ = sp.StrokeDrag(g, sel, centre, (275, 180)).apply(d)
+        dt = cv2.distanceTransform(part.astype(np.uint8), cv2.DIST_L2, 5)
+        ridge = (dt >= cv2.dilate(dt, np.ones((3, 3), np.uint8))) & (dt > 2)
+        ridge[:, :215] = False                           # the part that moved
+        assert 2 * np.percentile(dt[ridge], 10) >= 19     # still about 20 px across, everywhere
+
+
+def test_builds_can_be_extra_smooth(tmp_path, monkeypatch):
+    monkeypatch.setattr(sp, "LIBRARY", tmp_path / "library")
+    rng = np.random.default_rng(5)
+    rough = np.zeros((300, 300), bool)
+    rough[60:240, 60:240] = True
+    rough[60:240, 236:244] = rng.random((180, 8)) < 0.5   # a ragged edge
+    rough[100:104, 100:104] = False                       # a pinhole
+    b = sp.Build("rect", 20, 20, frame_mm=0.5, smooth=True)
+    b.chars = [sp.Placed("r", "rough", rough, cx=10, cy=10, scale=0.05)]
+    plain, smooth = sp.render_build(b, 20, smooth=False), sp.render_build(b, 20)
+    count = lambda a: len(cv2.findContours(a.astype(np.uint8), cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)[0])
+    assert count(smooth) < count(plain)                   # bits of the ragged edge and the pinhole gone
+    assert (smooth[:10] == plain[:10]).all()              # the frame is left exactly as it was
+    sp.save_build(b, "smooth one", None)
+    again = sp.load_build(sp.library_entries()[0])
+    assert again.smooth and (sp.render_build(again, 20) == smooth).all()

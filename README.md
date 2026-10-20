@@ -12,9 +12,9 @@ physical size on A4, ready to transfer onto a seal stone.
   is off, Crop manually lets you draw the seal's area yourself.
 - **Pure black and white.** The PDF holds a lossless 1-bit image at 1200 dpi. Red seal paste is read
   separately from black calligraphy around it, and stroke weight and edge smoothing are adjustable.
-- **Extra smooth.** For rough impressions: redraws every outline as clean curves, a best guess at the
-  intended strokes. Specks and pinholes go, ragged edges come out straight or evenly curved, and real
-  corners stay sharp.
+- **Extra smooth.** For rough impressions, on the main page and in builds: redraws every outline as
+  clean curves, a best guess at the intended strokes. Specks and pinholes go, ragged edges come out
+  straight or evenly curved, and real corners stay sharp.
 - **Square seals and other shapes.** Rectangles, ovals, circles and free-form seals keep their
   proportions and are sized by their longest length.
 - **Many seals on one sheet.** Each seal has its own size and number of copies, and everything is packed
@@ -36,7 +36,7 @@ physical size on A4, ready to transfer onto a seal stone.
   build and editing tools. Saving makes a new seal; the original stays as it is.
 - **Edit characters down to single strokes.** Squish a character horizontally or vertically and set its
   weight in fine steps. Draw along a stroke, or part of one, to select it, then drag it to stretch or
-  bend it like dough, or lengthen it at its free end. A lasso moves parts of a character, and an eraser
+  bend it like dough, keeping its thickness, or lengthen it at its free end. A lasso moves parts of a character, and an eraser
   removes them.
 - **Nothing is lost.** Every edit (squish, crop, strokes, lengthening, moving, erasing, weight) has an
   Original switch that shows the character without it; switching it back brings the edit back.
