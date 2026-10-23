@@ -30,7 +30,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import QPointF, QRectF, Qt
 
 APP_NAME = "Seal Print"
-__version__ = "1.8.0"
+__version__ = "1.9.0"
 A4_W, A4_H = 210.0, 297.0           # page size, mm
 PAGE_MARGIN = 10.0                  # mm kept clear at the paper edge
 EXPORT_DPI = 1200                   # resolution of the seal image inside the PDF
@@ -853,6 +853,8 @@ class Placed:
     use_lengthen: bool = True
     use_erase: bool = True
     use_move: bool = True
+    bend: float = 0.0                # bend like a bridge: 1 turns the bottom edge into ∩, -1 the top into ∪
+    use_bend: bool = True
     unify: bool = False              # any white-text (陰文) parts drawn as red text (朱文)
     invert: bool = False
     z: float = 0.0                   # stacking: higher is on top where characters overlap
@@ -861,7 +863,7 @@ class Placed:
 
 PLACED_FIELDS = ("glyph_id", "name", "cx", "cy", "scale", "sq_x", "sq_y", "use_squish", "crop", "use_crop",
                  "weight", "use_weight", "ops", "use_strokes", "use_lengthen", "use_erase", "use_move", "unify",
-                 "invert", "z")
+                 "bend", "use_bend", "invert", "z")
 OP_SWITCH = {"drag": "use_strokes", "lengthen": "use_lengthen", "erase": "use_erase", "move": "use_move"}
 
 
@@ -962,29 +964,107 @@ def edit_canvas(p: Placed, ops: list | None = None) -> np.ndarray:
     return g
 
 
+class Bend:
+    """Bending a whole character like a bridge. The box's bottom edge keeps its two corners where
+    they are and becomes an arc rising between them, the rest of the character standing on it;
+    at amount 1 the edge is a half circle (a straight line becomes ∩). Negative amounts bend the
+    other way, sagging from the top corners (∪). Every point keeps its distance from that edge,
+    measured square to the arc, so horizontal strokes keep their thickness as they bend."""
+
+    def __init__(self, box, amount: float):
+        x0, y0, x1, y1 = (float(v) for v in box)
+        self.th = math.pi * min(1.0, abs(amount))        # how far the edge turns from end to end
+        self.up = amount > 0
+        self.half, self.xm = max((x1 - x0) / 2, 1e-6), (x0 + x1) / 2
+        self.yr = y1 if self.up else y0                  # the edge that keeps its ends
+        self.R = self.half / math.sin(self.th / 2) if self.th > 1e-6 else 0.0
+        c = self.R * math.cos(self.th / 2)
+        self.cy = self.yr + c if self.up else self.yr - c        # centre of the arc
+
+    @property
+    def none(self) -> bool:
+        return self.th <= 1e-6
+
+    def forward(self, P) -> np.ndarray:
+        """Where points of the straight character end up."""
+        P = np.asarray(P, np.float64).reshape(-1, 2)
+        if self.none:
+            return P.copy()
+        phi = (P[:, 0] - self.xm) / self.half * (self.th / 2)
+        r = self.R + ((self.yr - P[:, 1]) if self.up else (P[:, 1] - self.yr))
+        y = self.cy - r * np.cos(phi) if self.up else self.cy + r * np.cos(phi)
+        return np.column_stack([self.xm + r * np.sin(phi), y])
+
+    def backward(self, Q) -> np.ndarray:
+        """Where points of the bent character came from."""
+        Q = np.asarray(Q, np.float64).reshape(-1, 2)
+        if self.none:
+            return Q.copy()
+        dx = Q[:, 0] - self.xm
+        dy = (self.cy - Q[:, 1]) if self.up else (Q[:, 1] - self.cy)
+        r, phi = np.hypot(dx, dy), np.arctan2(dx, dy)
+        y = self.yr - (r - self.R) if self.up else self.yr + (r - self.R)
+        return np.column_stack([self.xm + phi / (self.th / 2) * self.half, y])
+
+    def warp(self, g: np.ndarray, soft: bool = False):
+        """The bent image of g, on a canvas big enough to hold it: (image, x0, y0), where (x0, y0)
+        is where the new canvas's top-left pixel is in g's coordinates."""
+        H, W = g.shape
+        if self.none:
+            return g, 0, 0
+        ys, xs = np.nonzero(g > 0)
+        if not xs.size:
+            return g, 0, 0
+        corners = [(xs.min(), ys.min()), (xs.max() + 1, ys.min()), (xs.max() + 1, ys.max() + 1), (xs.min(), ys.max() + 1)]
+        edge = np.vstack([np.column_stack([np.linspace(a[0], b[0], 64), np.linspace(a[1], b[1], 64)])
+                          for a, b in zip(corners, corners[1:] + corners[:1])])
+        out = self.forward(edge)                          # the bent outline of the ink, to size the canvas
+        X0, Y0 = int(math.floor(out[:, 0].min())) - 2, int(math.floor(out[:, 1].min())) - 2
+        X1, Y1 = int(math.ceil(out[:, 0].max())) + 3, int(math.ceil(out[:, 1].max())) + 3
+        X, Y = np.meshgrid(np.arange(X0, X1, dtype=np.float64), np.arange(Y0, Y1, dtype=np.float64))
+        src = self.backward(np.column_stack([X.ravel(), Y.ravel()])).astype(np.float32)
+        img = cv2.remap(g.astype(np.float32), src[:, 0].reshape(X.shape), src[:, 1].reshape(X.shape),
+                        cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+        return (img if soft else img >= 0.5), X0, Y0
+
+
+def bend_box(p: Placed, pad: int) -> tuple:
+    """The box a bend pins: around the ink of the picture as picked, which never changes, on a
+    canvas padded by pad."""
+    ys, xs = np.nonzero(p.src)
+    if not xs.size:
+        return pad, pad, pad + p.src.shape[1], pad + p.src.shape[0]
+    return pad + xs.min(), pad + ys.min(), pad + xs.max() + 1, pad + ys.max() + 1
+
+
 def process_char(p: Placed) -> tuple[np.ndarray, int, int]:
     """The character as it appears, trimmed to its ink: (image, ox, oy), where (ox, oy) is
     where the picture's own pixel (0, 0) falls in that image."""
     ops = active_ops(p)
     crop = tuple(p.crop) if (p.crop is not None and p.use_crop) else None
-    key = (id(p.src), json.dumps(ops, sort_keys=True), p.weight if p.use_weight else 0, crop, p.unify)
+    bend = p.bend if p.use_bend else 0.0
+    key = (id(p.src), json.dumps(ops, sort_keys=True), p.weight if p.use_weight else 0, crop, p.unify, round(bend, 4))
     if p.cache is not None and p.cache[0] == key:
         return p.cache[1], p.cache[2], p.cache[3]
     pad = edit_pad(p) if ops else 0
     g = edit_canvas(p, ops) if ops else p.src
     if p.unify:
         g = to_zhuwen(g)
-    if p.use_weight and p.weight:
-        g = thicken(g, p.weight, max(p.src.shape), soft=True)    # edges kept to a fraction of a pixel
-    if crop is not None:
+    if crop is not None:                              # crop and bend work on the picture as picked
         x0, y0, x1, y1 = (int(round(v)) + pad for v in crop)
         keep = np.zeros(g.shape, bool)
         keep[max(0, y0):max(0, y1), max(0, x0):max(0, x1)] = True
-        g = g * keep if g.dtype != bool else g & keep
+        g = g & keep
+    px = py = pad                                     # where the picture's pixel (0, 0) is in g
+    if bend:
+        g, bx, by = Bend(bend_box(p, pad), bend).warp(g)
+        px, py = pad - bx, pad - by
+    if p.use_weight and p.weight:
+        g = thicken(g, p.weight, max(p.src.shape), soft=True)    # edges kept to a fraction of a pixel
     ys, xs = np.nonzero(g)
     if xs.size:
         img = g[ys.min():ys.max() + 1, xs.min():xs.max() + 1]
-        ox, oy = pad - int(xs.min()), pad - int(ys.min())
+        ox, oy = px - int(xs.min()), py - int(ys.min())
     else:
         img, ox, oy = np.zeros((1, 1), bool), 0, 0
     p.cache = (key, img, ox, oy)
@@ -3127,6 +3207,16 @@ class CharacterEditor(QtWidgets.QDialog):
         f.addRow("Vertical", _slider_row(self.sld_sq_v, self.lbl_sq_v))
         sv.addLayout(f)
 
+        row, self.orig_bend = section_with_original("Bend", "Show the character without the bend")
+        sv.addLayout(row)
+        sv.addWidget(muted_label("Bends the whole character like a bridge: right arches it up from its bottom "
+                                 "corners (a straight line becomes ∩ at the end), left sags it down from its "
+                                 "top corners (∪)."))
+        self.sld_bend = slider(-100, 100, "Right: arch up (∩) from the bottom corners. Left: sag down (∪) "
+                                          "from the top corners")
+        self.lbl_bend = QtWidgets.QLabel()
+        sv.addLayout(_slider_row(self.sld_bend, self.lbl_bend))
+
         row, self.orig_strokes = section_with_original("Strokes", "Show the strokes without the ones you pulled or bent")
         sv.addLayout(row)
         sv.addWidget(muted_label("1. Draw along a stroke, or along just the part you want to change.\n"
@@ -3189,6 +3279,8 @@ class CharacterEditor(QtWidgets.QDialog):
         self.sld_weight.setValue(w.weight)
         self.chk_invert.setChecked(w.invert)
         self.orig_squish.setChecked(not w.use_squish)
+        self.orig_bend.setChecked(not w.use_bend)
+        self.sld_bend.setValue(round(w.bend * 100))
         self.orig_strokes.setChecked(not w.use_strokes)
         self.orig_lengthen.setChecked(not w.use_lengthen)
         self.orig_erase.setChecked(not w.use_erase)
@@ -3201,6 +3293,8 @@ class CharacterEditor(QtWidgets.QDialog):
         self.chk_invert.toggled.connect(self.on_weight)
         self.sld_len.valueChanged.connect(self.on_lengthen)
         self.orig_squish.toggled.connect(self.on_originals)
+        self.orig_bend.toggled.connect(self.on_originals)
+        self.sld_bend.valueChanged.connect(self.on_bend)
         self.orig_weight.toggled.connect(self.on_originals)
         self.orig_strokes.toggled.connect(self.on_stroke_originals)
         self.orig_lengthen.toggled.connect(self.on_stroke_originals)
@@ -3248,6 +3342,9 @@ class CharacterEditor(QtWidgets.QDialog):
         w = self.work
         for s in (self.sld_sq_h, self.sld_sq_v):
             s.setEnabled(w.use_squish)
+        self.sld_bend.setEnabled(w.use_bend)
+        b = self.sld_bend.value()
+        self.lbl_bend.setText("0%" if not b else f"{'∩' if b > 0 else '∪'} {abs(b)}%")
         self.sld_weight.setEnabled(w.use_weight)
         self.btn_undo.setEnabled(self.editable() and bool(self.history))
         self.btn_restart.setEnabled(self.editable() and bool(w.ops))
@@ -3278,8 +3375,16 @@ class CharacterEditor(QtWidgets.QDialog):
         self.lbl_weight.setText(f"{change:+.2f} mm".replace("-", "−") if self.work.weight else "0 mm")
         self.refresh()
 
+    def on_bend(self, v):
+        if self._loading:
+            return
+        self.work.bend = v / 100
+        self.update_controls()
+        self.refresh(fit=True)
+
     def on_originals(self, *_):
         self.work.use_squish = not self.orig_squish.isChecked()
+        self.work.use_bend = not self.orig_bend.isChecked()
         self.work.use_weight = not self.orig_weight.isChecked()
         self.update_controls()
         self.refresh(fit=True)
@@ -3298,9 +3403,15 @@ class CharacterEditor(QtWidgets.QDialog):
         self.clear_selection()
 
     # ---- drawing
+    def bend(self) -> Bend:
+        """The bend as it applies to the editing canvas."""
+        w = self.work
+        return Bend(bend_box(w, self.pad), w.bend if w.use_bend else 0.0)
+
     def to_canvas(self, pt) -> np.ndarray:
+        """A point of the view in the canvas's own (unbent) pixels."""
         sx, sy = char_scale(self.work)
-        return np.array([pt.x() / sx, pt.y() / sy], dtype=np.float64)
+        return self.bend().backward([(pt.x() / sx, pt.y() / sy)])[0]
 
     def refresh(self, canvas=None, sel=None, centre=None, fit=False, poly=None):
         w = self.work
@@ -3310,39 +3421,51 @@ class CharacterEditor(QtWidgets.QDialog):
             if self.tool == "lasso" and self.lasso_poly is not None:
                 poly = self.lasso_poly
                 sel = g & lasso_mask(g.shape, poly)
-        outline = QtGui.QPainterPath()
-        if poly is not None and len(poly) > 2:
-            sx0, sy0 = char_scale(w)
-            outline.moveTo(poly[0][0] * sx0, poly[0][1] * sy0)
-            for x, y in poly[1:]:
-                outline.lineTo(x * sx0, y * sy0)
-            outline.closeSubpath()
-        self.view.lasso.setPath(outline)
-        shown = thicken(g, w.weight, max(w.src.shape)) if w.use_weight else g
-        H, W = shown.shape
+        bend = self.bend()
         sx, sy = char_scale(w)
+
+        def line_path(points, closed=False):
+            """A path through canvas points, as they look bent, in view coordinates."""
+            path = QtGui.QPainterPath()
+            if points is None or len(points) < 2:
+                return path
+            pts = np.asarray(points, np.float64)
+            if not bend.none:                         # follow the bend between the points
+                pts = _resample(np.vstack([pts, pts[:1]]) if closed else pts, 3.0)
+            pts = bend.forward(pts)
+            path.moveTo(pts[0][0] * sx, pts[0][1] * sy)
+            for x, y in pts[1:]:
+                path.lineTo(x * sx, y * sy)
+            if closed:
+                path.closeSubpath()
+            return path
+
+        self.view.lasso.setPath(line_path(poly, closed=True) if poly is not None and len(poly) > 2
+                                else QtGui.QPainterPath())
+        bent, bx, by = bend.warp(g)
+        shown = thicken(bent, w.weight, max(w.src.shape)) if w.use_weight else bent
+        H, W = shown.shape
         tf = QtGui.QTransform.fromScale(sx, sy)
         v = self.view
         v.pix.setPixmap(QtGui.QPixmap.fromImage(ink_to_qimage(~shown if w.invert else shown)))
         v.pix.setTransform(tf)
+        v.pix.setPos(bx * sx, by * sy)
         if sel is not None:
-            rgba = np.zeros((H, W, 4), np.uint8)
-            rgba[sel] = (216, 69, 47, 130)
-            img = QtGui.QImage(rgba.data, W, H, 4 * W, QtGui.QImage.Format.Format_RGBA8888).copy()
+            msk, mx, my = bend.warp(sel)
+            mh, mw = msk.shape
+            rgba = np.zeros((mh, mw, 4), np.uint8)
+            rgba[msk] = (216, 69, 47, 130)
+            img = QtGui.QImage(rgba.data, mw, mh, 4 * mw, QtGui.QImage.Format.Format_RGBA8888).copy()
             v.overlay.setPixmap(QtGui.QPixmap.fromImage(img))
             v.overlay.setTransform(tf)
+            v.overlay.setPos(mx * sx, my * sy)
         else:
             v.overlay.setPixmap(QtGui.QPixmap())
-        path = QtGui.QPainterPath()
-        if centre is not None and len(centre) > 1:
-            path.moveTo(centre[0][0] * sx, centre[0][1] * sy)
-            for x, y in centre[1:]:
-                path.lineTo(x * sx, y * sy)
-        v.centre.setPath(path)
+        v.centre.setPath(line_path(centre))
         for band in v.bands:
             band.hide()
         m = 0.04 * max(W * sx, H * sy)
-        v.scene().setSceneRect(QRectF(-m, -m, W * sx + 2 * m, H * sy + 2 * m))
+        v.scene().setSceneRect(QRectF(bx * sx - m, by * sy - m, W * sx + 2 * m, H * sy + 2 * m))
         if fit and v.auto_fit:
             v.fit()
 
@@ -3591,7 +3714,7 @@ class CharacterEditor(QtWidgets.QDialog):
         self.finish_lengthen()
         p, w = self.orig, self.work
         for k in ("sq_x", "sq_y", "use_squish", "weight", "use_weight", "ops", "use_strokes", "use_lengthen",
-                  "invert"):
+                  "use_erase", "use_move", "invert", "bend", "use_bend"):
             setattr(p, k, getattr(w, k))
         p.cache = None
         super().accept()

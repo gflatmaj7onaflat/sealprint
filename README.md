@@ -34,11 +34,12 @@ physical size on A4, ready to transfer onto a seal stone.
   canvas that zooms and has guides through the middle. Built seals print and load like any other seal.
 - **Change any seal, safely.** Edit build opens a copy of any saved seal, built or scanned, with all the
   build and editing tools. Saving makes a new seal; the original stays as it is.
-- **Edit characters down to single strokes.** Squish a character horizontally or vertically and set its
-  weight in fine steps. Draw along a stroke, or part of one, to select it, then drag it to stretch or
-  bend it like dough, keeping its thickness, or lengthen it at its free end. A lasso moves parts of a character, and an eraser
-  removes them.
-- **Nothing is lost.** Every edit (squish, crop, strokes, lengthening, moving, erasing, weight) has an
+- **Edit characters down to single strokes.** Squish a character horizontally or vertically, bend it
+  like a bridge (up to a half circle, its bottom corners staying put), and set its weight in fine
+  steps. Draw along a stroke, or part of one, to select it, then drag it to stretch or bend it like
+  dough, keeping its thickness, or lengthen it at its free end. A lasso moves parts of a character,
+  and an eraser removes them.
+- **Nothing is lost.** Every edit (squish, bend, crop, strokes, lengthening, moving, erasing, weight) has an
   Original switch that shows the character without it; switching it back brings the edit back.
 - **Two-tone themes.** Dark, Ink, Lacquer, Paper, Celadon, Blue and white, or your own two colours.
 
@@ -88,7 +89,7 @@ warning, then go to **System Settings → Privacy & Security**, scroll down to S
    is saved to the library like any other seal. Text (under Format) keeps each piece as picked or
    makes everything 朱文 or 陰文. The Handles switch under the seal sets what a character's handles
    do: Scale (keeps its proportions), Squish or Crop. Double-click a character to open its editor:
-   squish, strokes (draw along a stroke to select it, drag the selection to stretch or bend it,
+   squish, bend, strokes (draw along a stroke to select it, drag the selection to stretch or bend it,
    right-click to clear it, Ctrl+Z to undo), lengthen the selected stroke, Lasso to move a part,
    Eraser, and weight.
 5. Click the black-and-white seal to inspect it up close (scroll or + and − to zoom, click to go back).

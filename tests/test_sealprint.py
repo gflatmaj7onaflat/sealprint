@@ -462,3 +462,41 @@ def test_builds_can_be_extra_smooth(tmp_path, monkeypatch):
     sp.save_build(b, "smooth one", None)
     again = sp.load_build(sp.library_entries()[0])
     assert again.smooth and (sp.render_build(again, 20) == smooth).all()
+
+
+# ───────────────────────────── bend
+
+def test_bend_turns_a_straight_line_into_a_half_circle():
+    g = np.zeros((800, 800), bool)
+    g[400:420, 200:600] = True                           # a 400 x 20 bar; its bottom edge is y = 420
+    for amount, rise in ((0.5, 400 / 2 / math.sin(math.pi / 4) * (1 - math.cos(math.pi / 4))), (1.0, 200)):
+        bend = sp.Bend((200, 400, 600, 420), amount)
+        assert np.allclose(bend.forward([(200, 420), (600, 420)]), [(200, 420), (600, 420)])   # ends stay put
+        out, x0, y0 = bend.warp(g)
+        ys = np.nonzero(out)[0] + y0
+        assert abs((420 - 20 - ys.min()) - rise) <= 2       # the arch rises as far as the geometry says
+        dt = cv2.distanceTransform(out.astype(np.uint8), cv2.DIST_L2, 5)
+        ridge = (dt >= cv2.dilate(dt, np.ones((3, 3), np.uint8))) & (dt > 2)
+        assert abs(2 * np.median(dt[ridge]) - 20) <= 1      # and keeps its thickness
+    P = np.array([(250.0, 380.0), (400.0, 410.0), (590.0, 300.0)])
+    for amount in (0.3, -0.7, 1.0):
+        bend = sp.Bend((200, 400, 600, 420), amount)
+        assert np.allclose(bend.backward(bend.forward(P)), P)   # the two maps undo each other
+
+
+def test_bending_a_character_can_be_switched_off_and_is_saved(tmp_path, monkeypatch):
+    monkeypatch.setattr(sp, "LIBRARY", tmp_path / "library")
+    bar = np.zeros((40, 400), bool)
+    bar[10:30, 12:388] = True
+    b = sp.Build("rect", 20, 20, frame_mm=0)
+    p = sp.Placed("b", "一", bar, cx=10, cy=10, scale=0.04, bend=1.0)
+    b.chars = [p]
+    x, y, w, h = sp.char_rect(p)
+    assert h > 7 and abs((y + h) - 10.4) < 0.1           # an arch about 7.5 mm high, standing where it stood
+    straight = sp.char_rect(sp.Placed("b", "一", bar, cx=10, cy=10, scale=0.04))
+    p.use_bend = False
+    assert sp.char_rect(p) == pytest.approx(straight)    # Original: straight again
+    p.use_bend = True
+    sp.save_build(b, "arch", None)
+    again = sp.load_build(sp.library_entries()[0])
+    assert again.chars[0].bend == 1.0 and (sp.render_build(again, 20) == sp.render_build(b, 20)).all()
