@@ -30,7 +30,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import QPointF, QRectF, Qt
 
 APP_NAME = "Seal Print"
-__version__ = "1.9.0"
+__version__ = "1.10.0"
 A4_W, A4_H = 210.0, 297.0           # page size, mm
 PAGE_MARGIN = 10.0                  # mm kept clear at the paper edge
 EXPORT_DPI = 1200                   # resolution of the seal image inside the PDF
@@ -864,7 +864,8 @@ class Placed:
 PLACED_FIELDS = ("glyph_id", "name", "cx", "cy", "scale", "sq_x", "sq_y", "use_squish", "crop", "use_crop",
                  "weight", "use_weight", "ops", "use_strokes", "use_lengthen", "use_erase", "use_move", "unify",
                  "bend", "use_bend", "invert", "z")
-OP_SWITCH = {"drag": "use_strokes", "lengthen": "use_lengthen", "erase": "use_erase", "move": "use_move"}
+OP_SWITCH = {"drag": "use_strokes", "sbend": "use_strokes", "lengthen": "use_lengthen", "erase": "use_erase",
+             "move": "use_move"}
 
 
 def lasso_mask(shape, poly, offset: float = 0.0) -> np.ndarray:
@@ -952,6 +953,8 @@ def apply_op(g: np.ndarray, op: dict, pad: int) -> tuple[np.ndarray, np.ndarray 
         d = np.asarray(op["d"], np.float64)
         drag = StrokeDrag(g, sel, centre, np.asarray(op["grab"], np.float64) + pad, reach=float(np.hypot(*d)) + 8)
         return drag.apply(d)
+    if op["kind"] == "sbend":
+        return bend_stroke(g, sel, centre, float(op["amount"]))
     return lengthen_stroke(g, sel, centre, float(op["amount"]), int(op["end"]))
 
 
@@ -1160,6 +1163,18 @@ def select_stroke(ink: np.ndarray, path) -> tuple[np.ndarray, np.ndarray] | None
     if not hit.size:
         return None
     sel = np.isin(lab, hit)
+    # bits of ink left between the selection and nothing else (the square corners of a stroke's
+    # tip, slivers beside it) belong to the stroke: alone they would only be left behind as specks
+    rest = (ink & ~sel).astype(np.uint8)
+    n2, lab2, st2, _ = cv2.connectedComponentsWithStats(rest, connectivity=8)
+    if n2 > 1:
+        small = st2[:, cv2.CC_STAT_AREA] < max(9.0, 3.0 * float(np.median(half)) ** 2)
+        small[0] = False
+        if small.any():
+            touching = np.unique(lab2[(cv2.dilate(sel.astype(np.uint8), np.ones((3, 3), np.uint8)) > 0) & (rest > 0)])
+            take = np.zeros(n2, bool)
+            take[touching] = small[touching]
+            sel = sel | take[lab2]
     win = max(3, int(r)) | 1                          # smooth the hand-drawn path into a centreline
     kern = np.ones(win) / win
     padded = np.pad(pts, ((win // 2, win // 2), (0, 0)), mode="edge")
@@ -1167,71 +1182,192 @@ def select_stroke(ink: np.ndarray, path) -> tuple[np.ndarray, np.ndarray] | None
     return sel, centre
 
 
+def stroke_pins(ink: np.ndarray, sel: np.ndarray, c: np.ndarray, hw: float) -> list:
+    """Where a selected stroke is held: stretches of its centreline, as (from, to) arc lengths,
+    where it touches ink that isn't selected. That is where the selection cuts through a stroke,
+    and where another stroke joins or crosses it. Stroke edits keep these exactly in place, so
+    nothing attached ever breaks off."""
+    rest = (ink & ~sel).astype(np.uint8)
+    touch = sel & (cv2.dilate(rest, np.ones((3, 3), np.uint8)) > 0)
+    ys, xs = np.nonzero(touch)
+    if not xs.size:
+        return []
+    s_c, _ = _poly(c)
+    S = np.sort(_project(c, np.column_stack([xs, ys]).astype(np.float64))[0])
+    groups = np.split(S, np.nonzero(np.diff(S) > hw)[0] + 1)
+    pins = []
+    for g in groups:
+        a, b = max(0.0, float(g[0]) - 0.25 * hw), min(float(s_c[-1]), float(g[-1]) + 0.25 * hw)
+        if pins and a <= pins[-1][1]:
+            pins[-1] = (pins[-1][0], max(pins[-1][1], b))
+        else:
+            pins.append((a, b))
+    return pins
+
+
+def held_part(sel: np.ndarray, c: np.ndarray, pins: list) -> np.ndarray:
+    """The pixels of a selected stroke along its held stretches: these are kept exactly as they
+    are by every stroke edit, so joints with the rest of the character never change."""
+    keep = np.zeros_like(sel)
+    if not pins:
+        return keep
+    ys, xs = np.nonzero(sel)
+    if not xs.size:
+        return keep
+    x0, y0 = int(xs.min()), int(ys.min())
+    S, _ = _project_near(c, xs - x0, ys - y0, x0, y0, int(xs.max()) - x0 + 1, int(ys.max()) - y0 + 1)
+    held = np.zeros(len(S), bool)
+    for a, b in pins:
+        held |= (S >= a) & (S <= b)
+    keep[ys[held], xs[held]] = True
+    return keep
+
+
+def _extend_ends(poly: np.ndarray, ext: float, like: np.ndarray | None = None, hold=None) -> np.ndarray:
+    """A centreline carried on straight past both ends, so a stroke's rounded ends come along.
+    A held end keeps exactly the extension it had in `like`: by default an end that hasn't
+    moved, or as `hold` says (start, end)."""
+    k = min(4, len(poly) - 1)
+    t0 = (poly[0] - poly[k]) / max(float(np.hypot(*(poly[0] - poly[k]))), 1e-9)
+    t1 = (poly[-1] - poly[-1 - k]) / max(float(np.hypot(*(poly[-1] - poly[-1 - k]))), 1e-9)
+    out = np.vstack([poly[0] + t0 * ext, poly, poly[-1] + t1 * ext])
+    if like is not None:                               # a held end keeps its extension too
+        if hold is None:
+            hold = (np.allclose(poly[0], like[0], atol=1e-6), np.allclose(poly[-1], like[-1], atol=1e-6))
+        if hold[0]:
+            out[0] = _extend_ends(like, ext)[0]
+        if hold[1]:
+            out[-1] = _extend_ends(like, ext)[-1]
+    return out
+
+
+def restroke(ink: np.ndarray, sel: np.ndarray, old_c: np.ndarray, new_c: np.ndarray, hw: float, hold=None,
+             keep: np.ndarray | None = None):
+    """Redraw a selected stroke around a new centreline (same points, moved), with its own
+    cross-section square to wherever the line now runs, so it keeps its thickness however it is
+    stretched or bent. Returns (ink, the redrawn stroke)."""
+    H, W = ink.shape
+    ext = 2 * hw + 3
+    old_e = _extend_ends(old_c, ext)
+    new_e = _extend_ends(new_c, ext, like=old_c, hold=hold)
+    reach = int(math.ceil(2.2 * hw + 4))
+    x0, y0 = (max(0, int(v) - reach) for v in np.floor(new_e.min(0)))
+    x1, y1 = (min(m, int(v) + reach + 1) for v, m in zip(np.ceil(new_e.max(0)), (W, H)))
+    moved = np.zeros((H, W), bool)
+    if x1 > x0 and y1 > y0:
+        near = np.zeros((y1 - y0, x1 - x0), np.uint8)       # only pixels near the new line can be ink
+        cv2.polylines(near, [np.round(new_e - (x0, y0)).astype(np.int32).reshape(-1, 1, 2)], False, 1, 2 * reach + 1)
+        ys, xs = np.nonzero(near)
+        S, N = _project_near(new_e, xs, ys, x0, y0, x1 - x0, y1 - y0)
+        s_new, _ = _poly(new_e)                         # the same place along the old line, segment by segment
+        j = np.clip(np.searchsorted(s_new, S, side="right") - 1, 0, len(new_e) - 2)
+        frac = (S - s_new[j]) / np.maximum(s_new[j + 1] - s_new[j], 1e-9)
+        seg = old_e[j + 1] - old_e[j]
+        unit = seg / np.maximum(np.hypot(seg[:, 0], seg[:, 1]), 1e-9)[:, None]
+        src = (old_e[j] + frac[:, None] * seg + N[:, None] * np.column_stack([-unit[:, 1], unit[:, 0]]))
+        src = src.astype(np.float32)
+        n = len(src)                                    # remap takes at most 32767 columns: fold into rows
+        rows = max(1, -(-n // 4096))
+        fold = lambda v: np.pad(v, (0, rows * 4096 - n), constant_values=-10).reshape(rows, 4096)
+        vals = cv2.remap(sel.astype(np.float32), fold(src[:, 0]), fold(src[:, 1]), cv2.INTER_LINEAR,
+                         borderMode=cv2.BORDER_CONSTANT, borderValue=0).ravel()[:n]
+        moved[ys + y0, xs + x0] = vals >= 0.5
+    if keep is not None:                               # held stretches stay exactly as they were
+        moved |= keep
+    return (ink & ~sel) | moved, moved
+
+
+def _centreline(sel: np.ndarray, centre: np.ndarray):
+    """A stroke's centreline resampled for editing: (points, arc lengths, half-width)."""
+    length = float(np.hypot(*np.diff(centre, axis=0).T).sum())
+    c = _resample(centre, max(1.5, length / 60))
+    return c, np.r_[0.0, np.cumsum(np.hypot(*np.diff(c, axis=0).T))], _half_width(sel, c)
+
+
 class StrokeDrag:
-    """Pull or bend a selected stroke like dough. The grabbed point follows the mouse, the end
-    of the selection farthest from it stays where it is, and the part in between follows
-    smoothly, so pulling along the stroke stretches it and pulling sideways bends it. Only the
-    stroke's centreline moves; the stroke is then redrawn around it with its own cross-section,
-    square to wherever the line now runs, so it keeps its thickness however it is bent."""
+    """Pull or bend a selected stroke like dough. The grabbed point follows the mouse and the
+    stroke follows it smoothly up to wherever it is held: its pins, where it is attached to the
+    rest of the character, never move. With nothing holding it, the end farther from the grab
+    stays put. The stroke keeps its thickness however it is pulled."""
 
     def __init__(self, ink: np.ndarray, sel: np.ndarray, centre: np.ndarray, grab, reach: float | None = None):
         self.ink, self.sel = ink, sel
-        length = float(np.hypot(*np.diff(centre, axis=0).T).sum())
-        c = _resample(centre, max(1.5, length / 60))
-        s = np.r_[0.0, np.cumsum(np.hypot(*np.diff(c, axis=0).T))]
-        self.c, self.s, self.L = c, s, max(float(s[-1]), 1e-6)
-        self.tg = float(_nearest_param(c, s, np.asarray(grab, np.float64).reshape(1, 2))[0])
-        self.from_start = self.tg >= self.L / 2       # anchored at the end farther from the grab
-        self.hw = _half_width(sel, c)
-        self.sel_f = sel.astype(np.float32)
+        self.c, self.s, self.hw = _centreline(sel, centre)
+        self.L = max(float(self.s[-1]), 1e-6)
+        self.tg = float(_nearest_param(self.c, self.s, np.asarray(grab, np.float64).reshape(1, 2))[0])
+        self.pins = stroke_pins(ink, sel, self.c, self.hw)
+        self.keep = held_part(sel, self.c, self.pins)
+        self.held = any(a - self.hw <= self.tg <= b + self.hw for a, b in self.pins)   # grabbed at a joint
 
     def weight(self, t):
-        if self.from_start:
-            u = np.clip(t / max(self.tg, 1e-6), 0.0, 1.0)
-        else:
-            u = np.clip((self.L - t) / max(self.L - self.tg, 1e-6), 0.0, 1.0)
-        return u * u * (3.0 - 2.0 * u)                # smooth at both ends of the bend
-
-    def _with_ends(self, poly: np.ndarray, ext: float) -> np.ndarray:
-        """The centreline carried on straight past both ends, so the stroke's ends come along."""
-        k = min(4, len(poly) - 1)
-        t0 = (poly[0] - poly[k]) / max(float(np.hypot(*(poly[0] - poly[k]))), 1e-9)
-        t1 = (poly[-1] - poly[-1 - k]) / max(float(np.hypot(*(poly[-1] - poly[-1 - k]))), 1e-9)
-        return np.vstack([poly[0] + t0 * ext, poly, poly[-1] + t1 * ext])
+        """How far each point along the stroke follows the grab: 1 at the grab, 0 at every pin."""
+        t = np.asarray(t, np.float64)
+        smooth = lambda u: (lambda v: v * v * (3.0 - 2.0 * v))(np.clip(u, 0.0, 1.0))
+        if self.held:
+            return np.zeros_like(t)
+        left = [b for a, b in self.pins if b <= self.tg]
+        right = [a for a, b in self.pins if a >= self.tg]
+        if not left and not right:                    # free: the far end stays put
+            if self.tg >= self.L / 2:
+                return smooth(t / max(self.tg, 1e-6))
+            return smooth((self.L - t) / max(self.L - self.tg, 1e-6))
+        w = np.ones_like(t)
+        if left:
+            lo = max(left)
+            w = np.where(t <= self.tg, smooth((t - lo) / max(self.tg - lo, 1e-6)), w)
+        if right:
+            hi = min(right)
+            w = np.where(t >= self.tg, smooth((hi - t) / max(hi - self.tg, 1e-6)), w)
+        return w
 
     def apply(self, d) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """The character with the stroke dragged by d pixels: (ink, selection, centreline)."""
-        dx, dy = float(d[0]), float(d[1])
-        new = self.c + np.outer(self.weight(self.s), (dx, dy))      # the centreline moves like dough
-        H, W = self.ink.shape
-        ext = 2 * self.hw + 3
-        old_e, new_e = self._with_ends(self.c, ext), self._with_ends(new, ext)
-        anchor = 0 if self.from_start else -1                     # the end that stays put stays exactly put
-        new_e[anchor] = old_e[anchor]
-        reach = int(math.ceil(2.2 * self.hw + 4))
-        x0, y0 = (max(0, int(v) - reach) for v in np.floor(new_e.min(0)))
-        x1, y1 = (min(m, int(v) + reach + 1) for v, m in zip(np.ceil(new_e.max(0)), (W, H)))
-        moved = np.zeros((H, W), bool)
-        if x1 > x0 and y1 > y0:
-            near = np.zeros((y1 - y0, x1 - x0), np.uint8)       # only pixels near the new line can be ink
-            cv2.polylines(near, [np.round(new_e - (x0, y0)).astype(np.int32).reshape(-1, 1, 2)], False, 1,
-                          2 * reach + 1)
-            ys, xs = np.nonzero(near)
-            S, N = _project_near(new_e, xs, ys, x0, y0, x1 - x0, y1 - y0)
-            s_new, _ = _poly(new_e)                   # the same place along the old line, segment by segment
-            j = np.clip(np.searchsorted(s_new, S, side="right") - 1, 0, len(new_e) - 2)
-            frac = (S - s_new[j]) / np.maximum(s_new[j + 1] - s_new[j], 1e-9)
-            seg = old_e[j + 1] - old_e[j]
-            unit = seg / np.maximum(np.hypot(seg[:, 0], seg[:, 1]), 1e-9)[:, None]
-            src = (old_e[j] + frac[:, None] * seg + N[:, None] * np.column_stack([-unit[:, 1], unit[:, 0]]))
-            src = src.astype(np.float32)
-            n = len(src)                              # remap takes at most 32767 columns: fold into rows
-            rows = max(1, -(-n // 4096))
-            fold = lambda v: np.pad(v, (0, rows * 4096 - n), constant_values=-10).reshape(rows, 4096)
-            vals = cv2.remap(self.sel_f, fold(src[:, 0]), fold(src[:, 1]), cv2.INTER_LINEAR,
-                             borderMode=cv2.BORDER_CONSTANT, borderValue=0).ravel()[:n]
-            moved[ys + y0, xs + x0] = vals >= 0.5
-        return (self.ink & ~self.sel) | moved, moved, new
+        new = self.c + np.outer(self.weight(self.s), (float(d[0]), float(d[1])))
+        out, moved = restroke(self.ink, self.sel, self.c, new, self.hw, keep=self.keep)
+        return out, moved, new
+
+
+def bend_direction(centre: np.ndarray) -> str:
+    """Which way a positive stroke bend bows: up for a lying stroke, left for a standing one."""
+    d = np.asarray(centre[-1], np.float64) - np.asarray(centre[0], np.float64)
+    return "up" if abs(d[0]) >= abs(d[1]) else "left"
+
+
+def bend_stroke(ink: np.ndarray, sel: np.ndarray, centre: np.ndarray, amount: float):
+    """Bend a selected stroke like a bridge: its ends, and every place it is attached, stay where
+    they are, and the stretches between them arch up to a half circle at amount 1 (up for a lying
+    stroke, left for a standing one; negative the other way). Returns (ink, stroke, centreline)."""
+    if abs(amount) < 1e-6 or len(centre) < 2:
+        return ink, sel, centre
+    c, s, hw = _centreline(sel, centre)
+    L = float(s[-1])
+    spans, prev = [], 0.0                              # the free stretches between pins
+    for a, b in stroke_pins(ink, sel, c, hw):
+        if a > prev:
+            spans.append((prev, a))
+        prev = max(prev, b)
+    if prev < L:
+        spans.append((prev, L))
+    pins = stroke_pins(ink, sel, c, hw)
+    hold = (any(a <= 1e-6 for a, b in pins), any(b >= L - 1e-6 for a, b in pins))   # ends attached to something
+    new = c.copy()
+    lying = bend_direction(c) == "up"
+    for s0, s1 in spans:
+        if s1 - s0 < 2 * hw:
+            continue
+        inside = (s >= s0) & (s <= s1)
+        p0 = np.array([np.interp(s0, s, c[:, 0]), np.interp(s0, s, c[:, 1])])
+        p1 = np.array([np.interp(s1, s, c[:, 0]), np.interp(s1, s, c[:, 1])])
+        u = (p1 - p0) / max(float(np.hypot(*(p1 - p0))), 1e-9)
+        n = np.array([-u[1], u[0]])
+        if (lying and n[1] < 0) or (not lying and n[0] < 0):
+            n = -n                                     # so that a positive bend bows up (or left)
+        rel = c[inside] - p0
+        frame = np.column_stack([rel @ u, rel @ n])
+        bent = Bend((0.0, 0.0, float(np.hypot(*(p1 - p0))), 0.0), amount).forward(frame)
+        new[inside] = p0 + bent[:, :1] * u + bent[:, 1:] * n
+    out, moved = restroke(ink, sel, c, new, hw, hold=hold, keep=held_part(sel, c, pins))
+    return out, moved, new
 
 
 def fit_glyph(g: np.ndarray, gw: int, gh: int) -> np.ndarray:
@@ -1336,39 +1472,25 @@ def _half_width(sel: np.ndarray, c: np.ndarray) -> float:
     return max(1.0, float(np.median(v[v > 0])) if (v > 0).any() else 1.0)
 
 
-def free_end(ink: np.ndarray, sel: np.ndarray, centre: np.ndarray) -> int:
-    """Which end of a selected stroke to lengthen (0 = start, 1 = end of its centreline): the one
-    that is a free tip, if the other runs on into more ink. Otherwise the end it was drawn towards."""
-    c = _resample(centre, 1.0)
-    if len(c) < 3:
+def free_end(ink: np.ndarray, sel: np.ndarray, centre: np.ndarray) -> int | None:
+    """Which end of a selected stroke can grow (0 = start, 1 = end of its centreline): one that
+    isn't attached to anything, preferring the end it was drawn towards. None if both ends are
+    held, since lengthening would tear one of them off."""
+    c, s, hw = _centreline(sel, centre)
+    pins = stroke_pins(ink, sel, c, hw)
+    start_free = not any(a <= 1.5 * hw for a, b in pins)
+    end_free = not any(b >= s[-1] - 1.5 * hw for a, b in pins)
+    if end_free:
         return 1
-    H, W = ink.shape
-    hw = _half_width(sel, c)
-    k = min(6, len(c) - 1)
-
-    def attached(pt, out):
-        out = out / max(np.hypot(*out), 1e-9)
-        for ang in (0.0, 0.6, -0.6, 1.2, -1.2):       # straight on, and turning off to either side
-            ca, sa = math.cos(ang), math.sin(ang)
-            d = np.array([out[0] * ca - out[1] * sa, out[0] * sa + out[1] * ca])
-            for dist in np.linspace(hw + 2, 2.5 * hw + 4, 5):
-                x, y = int(round(pt[0] + d[0] * dist)), int(round(pt[1] + d[1] * dist))
-                if 0 <= x < W and 0 <= y < H and ink[y, x] and not sel[y, x]:
-                    return True
-        return False
-
-    start_attached = attached(c[0], c[0] - c[k])
-    end_attached = attached(c[-1], c[-1] - c[-1 - k])
-    if end_attached and not start_attached:
-        return 0
-    return 1
+    return 0 if start_free else None
 
 
-def _insertion_index(sel: np.ndarray, c: np.ndarray, s_c: np.ndarray, hw: float) -> int:
+def _insertion_index(sel: np.ndarray, c: np.ndarray, s_c: np.ndarray, hw: float, after: float = 0.0) -> int:
     """Where to add length to a stroke: a straight spot, clear of strokes crossing it, not too
-    close to either end of the selection."""
+    close to either end of the selection, and beyond `after` (the last place it is held)."""
     n, L = len(c), float(s_c[-1])
-    lo, hi = int(np.searchsorted(s_c, 0.15 * L)), int(np.searchsorted(s_c, 0.85 * L))
+    first = max(0.15 * L, min(after + hw, 0.85 * L - 3))
+    lo, hi = int(np.searchsorted(s_c, first)), int(np.searchsorted(s_c, 0.85 * L))
     if hi - lo < 3:
         return n // 2
     H, W = sel.shape
@@ -1395,15 +1517,18 @@ def lengthen_stroke(ink: np.ndarray, sel: np.ndarray, centre: np.ndarray, amount
     tip) moves out as one piece, so the stroke keeps its thickness and the shape of its end.
     Returns (ink, stroke, centreline)."""
     c = _resample(centre, 1.0)
-    if amount <= 0 or len(c) < 6:
+    if amount <= 0 or len(c) < 6 or end is None:
         return ink, sel, centre
     if end == 0:
         c = c[::-1]
     H, W = ink.shape
     hw = _half_width(sel, c)
     s_c, _ = _poly(c)
+    pins = stroke_pins(ink, sel, c, hw)
+    if any(b >= s_c[-1] - 1.5 * hw for a, b in pins):  # the end that would move is attached
+        return ink, sel, centre
     dL = amount * float(s_c[-1])
-    i = _insertion_index(sel, c, s_c, hw)
+    i = _insertion_index(sel, c, s_c, hw, after=max((b for a, b in pins), default=0.0))
     k = max(2, int(round(hw)))
     t = c[min(len(c) - 1, i + k)] - c[max(0, i - k)]
     t /= max(np.hypot(*t), 1e-9)                      # the stroke's direction where length is added
@@ -3143,7 +3268,7 @@ class CharacterEditor(QtWidgets.QDialog):
         self.pad = edit_pad(self.work)
         self.canvas = edit_canvas(self.work)
         self.sel = self.centre = self.sel_path = None
-        self.len_op = self.len_base = None
+        self.slide = None                      # the Lengthen or Bend being set on the selected stroke
         self.history: list[tuple] = []
         self.drag = self.grab_at = self.pending = None
         self.path: list = []
@@ -3155,7 +3280,7 @@ class CharacterEditor(QtWidgets.QDialog):
         self.len_timer = QtCore.QTimer(self)
         self.len_timer.setSingleShot(True)
         self.len_timer.setInterval(40)
-        self.len_timer.timeout.connect(self._apply_lengthen)
+        self.len_timer.timeout.connect(self._apply_slide)
 
         self.tool = "strokes"
         self.erase_pts: list = []
@@ -3221,8 +3346,17 @@ class CharacterEditor(QtWidgets.QDialog):
         sv.addLayout(row)
         sv.addWidget(muted_label("1. Draw along a stroke, or along just the part you want to change.\n"
                                  "2. Drag any point of the red selection: along the stroke to stretch it, sideways "
-                                 "to bend it. The far end of the selection stays put.\n"
+                                 "to bend it. Wherever it is attached to the rest of the character stays put, so "
+                                 "nothing breaks off.\n"
                                  "Right-click clears the selection."))
+        bend_row = QtWidgets.QHBoxLayout()
+        bend_row.addWidget(QtWidgets.QLabel("Bend"))
+        self.sld_sbend = slider(-100, 100, "Bends the selected stroke like a bridge: its ends and wherever it is "
+                                           "attached stay put. At the end of the slider a straight stroke becomes a "
+                                           "half circle")
+        self.lbl_sbend = QtWidgets.QLabel()
+        bend_row.addLayout(_slider_row(self.sld_sbend, self.lbl_sbend), 1)
+        sv.addLayout(bend_row)
         row = QtWidgets.QHBoxLayout()
         self.btn_undo = QtWidgets.QPushButton("Undo")
         self.btn_undo.setToolTip("Undo the last change to the strokes (Ctrl+Z)")
@@ -3291,7 +3425,8 @@ class CharacterEditor(QtWidgets.QDialog):
             s.valueChanged.connect(self.on_squish)
         self.sld_weight.valueChanged.connect(self.on_weight)
         self.chk_invert.toggled.connect(self.on_weight)
-        self.sld_len.valueChanged.connect(self.on_lengthen)
+        self.sld_len.valueChanged.connect(lambda v: self.on_slide("lengthen", v))
+        self.sld_sbend.valueChanged.connect(lambda v: self.on_slide("sbend", v))
         self.orig_squish.toggled.connect(self.on_originals)
         self.orig_bend.toggled.connect(self.on_originals)
         self.sld_bend.valueChanged.connect(self.on_bend)
@@ -3350,6 +3485,11 @@ class CharacterEditor(QtWidgets.QDialog):
         self.btn_restart.setEnabled(self.editable() and bool(w.ops))
         self.sld_len.setEnabled(self.editable() and self.sel is not None and self.tool == "strokes")
         self.lbl_len.setText(f"{self.sld_len.value()}%")
+        self.sld_sbend.setEnabled(self.editable() and self.sel is not None and self.tool == "strokes")
+        v = self.sld_sbend.value()
+        lying = self.centre is None or bend_direction(self.centre) == "up"
+        arrow = ("↑" if v > 0 else "↓") if lying else ("←" if v > 0 else "→")
+        self.lbl_sbend.setText(f"{arrow} {abs(v)}%" if v else "0%")
         self.sld_brush.setEnabled(self.tool == "erase" and self.editable())
         if not self.editable():
             self.hint.setText("Turn off Original under Strokes, Lengthen, Move and Eraser to change strokes.")
@@ -3516,6 +3656,11 @@ class CharacterEditor(QtWidgets.QDialog):
                 self.drag = StrokeDrag(self.canvas, self.sel, self.centre, b)
             finally:
                 QtWidgets.QApplication.restoreOverrideCursor()
+            if self.drag.held:
+                self.drag = None
+                self.hint.setText("That spot is attached to the rest of the character, so it stays put. "
+                                  "Grab the stroke between the places it is attached.")
+                return
             self.grab_at = b
             self.hint.setText("Pull along the stroke to stretch it, or sideways to bend it.")
         else:
@@ -3606,14 +3751,15 @@ class CharacterEditor(QtWidgets.QDialog):
             self.refresh()
             return
         path, self.path = self.path, []
+        if not path:                                   # nothing was started (a held spot was grabbed)
+            return
         self.view.trace.setPath(QtGui.QPainterPath())
         if len(path) > 2 and self.select_along(path):
-            self.hint.setText("Drag any point of the red stroke, or use Lengthen. Right-click clears the selection.")
+            self.hint.setText("Drag any point of the red stroke, or use Bend or Lengthen. Right-click clears the "
+                              "selection.")
         else:
             self.hint.setText("No stroke found there. Draw along the middle of a stroke.")
-        self._loading = True
-        self.sld_len.setValue(0)
-        self._loading = False
+        self._sliders_to_zero()
         self.update_controls()
         self.refresh()
 
@@ -3634,52 +3780,75 @@ class CharacterEditor(QtWidgets.QDialog):
         self.update_controls()
         self.refresh()
 
-    # ---- lengthening the selected stroke
-    def on_lengthen(self, v):
-        self.lbl_len.setText(f"{v}%")
+    # ---- lengthening or bending the selected stroke with a slider
+    def _sliders_to_zero(self):
+        self._loading = True
+        self.sld_len.setValue(0)
+        self.sld_sbend.setValue(0)
+        self._loading = False
+
+    def on_slide(self, kind: str, v: int):
         if self._loading or self.sel is None or not self.editable():
+            self.update_controls()
             return
-        if self.len_op is None:
-            if v <= 0:
+        if self.slide is not None and self.slide["op"]["kind"] != kind:
+            self.finish_slide(keep_slider=kind)        # the other edit is done: build on it
+        if self.slide is None:
+            if v == 0:
                 return
+            op = {"kind": kind, "path": (self.sel_path - self.pad).tolist(), "amount": 0.0}
+            if kind == "lengthen":
+                end = free_end(self.canvas, self.sel, self.centre)
+                if end is None:
+                    self.hint.setText("This stroke is attached at both ends, so it can't get longer without "
+                                      "breaking off. Bend it instead.")
+                    self._sliders_to_zero()
+                    return
+                op["end"] = end
             self.remember()
-            self.len_base = (self.canvas.copy(), self.sel_path.copy())
-            self.len_op = {"kind": "lengthen", "path": (self.sel_path - self.pad).tolist(), "amount": 0.0,
-                           "end": free_end(self.canvas, self.sel, self.centre)}
-            self.work.ops.append(self.len_op)
-        self.len_op["amount"] = v / 100
+            self.slide = {"op": op, "base": (self.canvas.copy(), self.sel_path.copy())}
+            self.work.ops.append(op)
+        self.slide["op"]["amount"] = v / 100
+        self.update_controls()
         self.len_timer.start()
 
-    def _apply_lengthen(self):
-        if self.len_op is None:
+    def _apply_slide(self):
+        if self.slide is None:
             return
-        base, path = self.len_base
-        if self.len_op["amount"] <= 0:              # slid back to nothing
+        base, path = self.slide["base"]
+        if not self.slide["op"]["amount"]:            # slid back to nothing
             self.canvas = base
             self.select_along(path)
         else:
-            self.canvas, sel, centre = apply_op(base, self.len_op, self.pad)
+            self.canvas, sel, centre = apply_op(base, self.slide["op"], self.pad)
             if sel is not None:
                 self.sel, self.centre = sel, centre
         self.update_controls()
         self.refresh()
 
-    def finish_lengthen(self):
-        """Keep the lengthening as it is; the longer stroke becomes the selection."""
-        if self.len_op is None:
+    def finish_slide(self, keep_slider: str | None = None):
+        """Keep the lengthening or bending as it is; the changed stroke becomes the selection."""
+        if self.slide is None:
             return
         self.len_timer.stop()
-        self._apply_lengthen()
-        if self.len_op["amount"] <= 0:
-            self.work.ops = [op for op in self.work.ops if op is not self.len_op]
+        self._apply_slide()
+        op = self.slide["op"]
+        if not op["amount"]:
+            self.work.ops = [o for o in self.work.ops if o is not op]
             if self.history:
                 self.history.pop()
         elif self.centre is not None and not self.select_along(self.centre):
             self.sel = self.centre = self.sel_path = None
-        self.len_op = self.len_base = None
-        self._loading = True
-        self.sld_len.setValue(0)
-        self._loading = False
+        self.slide = None
+        if keep_slider is None:
+            self._sliders_to_zero()
+        else:                                          # the slider being moved keeps its place
+            self._loading = True
+            (self.sld_sbend if keep_slider == "lengthen" else self.sld_len).setValue(0)
+            self._loading = False
+
+    finish_lengthen = finish_slide
+
 
     # ---- undo
     def remember(self):
@@ -3693,11 +3862,9 @@ class CharacterEditor(QtWidgets.QDialog):
         if not self.history or not self.editable():
             return
         self.len_timer.stop()
-        self.len_op = self.len_base = None
+        self.slide = None
         self.work.ops, self.canvas, self.sel, self.centre, self.sel_path = self.history.pop()
-        self._loading = True
-        self.sld_len.setValue(0)
-        self._loading = False
+        self._sliders_to_zero()
         self.update_controls()
         self.refresh()
 

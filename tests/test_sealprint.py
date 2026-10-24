@@ -500,3 +500,76 @@ def test_bending_a_character_can_be_switched_off_and_is_saved(tmp_path, monkeypa
     sp.save_build(b, "arch", None)
     again = sp.load_build(sp.library_entries()[0])
     assert again.chars[0].bend == 1.0 and (sp.render_build(again, 20) == sp.render_build(b, 20)).all()
+
+
+# ───────────────────────────── attachments stay attached; bending a stroke
+
+def letter_h():
+    g = np.zeros((500, 500), bool)
+    g[100:400, 100:120] = g[100:400, 300:320] = True     # two uprights
+    g[240:260, 100:320] = True                           # and a crossbar attached to both
+    return g
+
+
+def pieces(g):
+    return cv2.connectedComponents(g.astype(np.uint8), connectivity=8)[0] - 1
+
+
+CROSSBAR = np.column_stack([np.linspace(125, 295, 40), np.full(40, 250.0)])
+
+
+def test_dragging_a_stroke_never_breaks_what_it_is_attached_to():
+    h = letter_h()
+    sel, centre = sp.select_stroke(h, CROSSBAR)
+    for grab, d in (((210, 250), (0, -60)), ((285, 250), (0, -60)), ((150, 250), (30, 40))):
+        out, _, _ = sp.StrokeDrag(h, sel, centre, grab).apply(d)
+        assert pieces(out) == 1                          # still one piece, whichever point is pulled
+        assert (out[100:400, 100:120] == h[100:400, 100:120]).all()   # the uprights are untouched
+    cross = np.zeros((500, 500), bool)
+    cross[240:260, 60:440] = cross[100:400, 240:260] = True
+    sel, centre = sp.select_stroke(cross, np.column_stack([np.linspace(65, 435, 60), np.full(60, 250.0)]))
+    out, _, _ = sp.StrokeDrag(cross, sel, centre, (430, 250)).apply((0, 60))
+    assert pieces(out) == 1 and (out[:, 60:230] == cross[:, 60:230]).all()   # the crossing holds, the left half too
+
+
+def test_bending_a_selected_stroke_keeps_its_ends_and_attachments():
+    h = letter_h()
+    sel, centre = sp.select_stroke(h, CROSSBAR)
+    out, part, _ = sp.bend_stroke(h, sel, centre, 0.7)
+    assert pieces(out) == 1 and part[:230].any()         # arched up, still attached to both uprights
+    bar = np.zeros((500, 500), bool)
+    bar[240:260, 100:400] = True
+    sel, centre = sp.select_stroke(bar, np.column_stack([np.linspace(105, 395, 60), np.full(60, 250.0)]))
+    out, part, _ = sp.bend_stroke(bar, sel, centre, 1.0)
+    ys, xs = np.nonzero(out)
+    assert pieces(out) == 1 and 90 <= ys.min() <= 115    # a half circle about 150 px high
+    assert xs.min() >= 90 and xs.max() <= 410            # with its feet where the ends were
+    dt = cv2.distanceTransform(part.astype(np.uint8), cv2.DIST_L2, 5)
+    ridge = (dt >= cv2.dilate(dt, np.ones((3, 3), np.uint8))) & (dt > 2)
+    assert abs(2 * np.median(dt[ridge]) - 20) <= 1       # and its thickness
+
+
+def test_lengthen_only_grows_a_free_end():
+    h = letter_h()
+    sel, centre = sp.select_stroke(h, CROSSBAR)
+    assert sp.free_end(h, sel, centre) is None           # held at both ends: it won't tear one off
+    out, _, _ = sp.lengthen_stroke(h, sel, centre, 0.3, 1)
+    assert (out == h).all()
+    t = np.zeros((500, 500), bool)
+    t[100:120, 100:400] = t[100:400, 240:260] = True     # a T: the stem's foot is free
+    sel, centre = sp.select_stroke(t, np.column_stack([np.full(40, 250.0), np.linspace(125, 395, 40)]))
+    end = sp.free_end(t, sel, centre)
+    out, _, _ = sp.lengthen_stroke(t, sel, centre, 0.3, end)
+    assert pieces(out) == 1 and np.nonzero(out[:, 250])[0].max() > 460   # the foot went down, the top held
+
+
+def test_stroke_bends_replay_and_switch_off_with_the_strokes():
+    h = letter_h()
+    p = sp.Placed("h", "H", h, cx=10, cy=10, scale=0.04)
+    plain = sp.process_char(p)[0].copy()
+    p.ops = [{"kind": "sbend", "path": (CROSSBAR - 0).tolist(), "amount": 0.7}]
+    p.cache = None
+    bent = sp.process_char(p)[0]
+    assert bent.shape != plain.shape or (bent != plain).any()
+    p.use_strokes = False
+    assert (sp.process_char(p)[0] == plain).all()

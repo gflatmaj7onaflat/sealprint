@@ -37,8 +37,9 @@ physical size on A4, ready to transfer onto a seal stone.
 - **Edit characters down to single strokes.** Squish a character horizontally or vertically, bend it
   like a bridge (up to a half circle, its bottom corners staying put), and set its weight in fine
   steps. Draw along a stroke, or part of one, to select it, then drag it to stretch or bend it like
-  dough, keeping its thickness, or lengthen it at its free end. A lasso moves parts of a character,
-  and an eraser removes them.
+  dough, bend it into an arch with a slider, or lengthen it at its free end. Strokes keep their
+  thickness, and wherever a stroke is attached to the rest of the character stays put, so nothing
+  breaks off. A lasso moves parts of a character, and an eraser removes them.
 - **Nothing is lost.** Every edit (squish, bend, crop, strokes, lengthening, moving, erasing, weight) has an
   Original switch that shows the character without it; switching it back brings the edit back.
 - **Two-tone themes.** Dark, Ink, Lacquer, Paper, Celadon, Blue and white, or your own two colours.
