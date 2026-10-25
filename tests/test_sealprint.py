@@ -573,3 +573,20 @@ def test_stroke_bends_replay_and_switch_off_with_the_strokes():
     assert bent.shape != plain.shape or (bent != plain).any()
     p.use_strokes = False
     assert (sp.process_char(p)[0] == plain).all()
+
+
+def test_turning_a_lasso_part_about_its_middle():
+    g = np.zeros((400, 400), bool)
+    g[190:210, 100:300] = True                           # a lying bar
+    poly = [[90, 180], [310, 180], [310, 220], [90, 220]]
+    turned = sp.turn_part(g, sp.lasso_mask(g.shape, poly), (200, 200), 90)
+    ys, xs = np.nonzero(turned)
+    assert np.ptp(xs) < 25 and np.ptp(ys) > 190          # standing now, about the same place
+    assert abs(xs.mean() - 200) < 2 and abs(ys.mean() - 200) < 2
+    assert np.allclose(sp.turn_points([[300, 200]], np.array([200.0, 200.0]), 90), [[200, 300]])   # clockwise on screen
+    p = sp.Placed("b", "一", g, cx=10, cy=10, scale=0.05)
+    p.ops = [{"kind": "turn", "poly": poly, "centre": [200, 200], "angle": 90}]
+    img = sp.process_char(p)[0]
+    assert img.shape[0] > img.shape[1]                   # replayed: the character is tall now
+    p.use_move = False
+    assert sp.process_char(p)[0].shape[1] > sp.process_char(p)[0].shape[0]   # Original: lying again

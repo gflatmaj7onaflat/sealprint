@@ -39,8 +39,8 @@ physical size on A4, ready to transfer onto a seal stone.
   steps. Draw along a stroke, or part of one, to select it, then drag it to stretch or bend it like
   dough, bend it into an arch with a slider, or lengthen it at its free end. Strokes keep their
   thickness, and wherever a stroke is attached to the rest of the character stays put, so nothing
-  breaks off. A lasso moves parts of a character, and an eraser removes them.
-- **Nothing is lost.** Every edit (squish, bend, crop, strokes, lengthening, moving, erasing, weight) has an
+  breaks off. A lasso moves or turns parts of a character, and an eraser removes them.
+- **Nothing is lost.** Every edit (squish, bend, crop, strokes, lengthening, moving, turning, erasing, weight) has an
   Original switch that shows the character without it; switching it back brings the edit back.
 - **Two-tone themes.** Dark, Ink, Lacquer, Paper, Celadon, Blue and white, or your own two colours.
 
@@ -91,8 +91,9 @@ warning, then go to **System Settings → Privacy & Security**, scroll down to S
    makes everything 朱文 or 陰文. The Handles switch under the seal sets what a character's handles
    do: Scale (keeps its proportions), Squish or Crop. Double-click a character to open its editor:
    squish, bend, strokes (draw along a stroke to select it, drag the selection to stretch or bend it,
-   right-click to clear it, Ctrl+Z to undo), lengthen the selected stroke, Lasso to move a part,
-   Eraser, and weight.
+   right-click to clear it, Ctrl+Z to undo), lengthen the selected stroke, Lasso to move or turn a part
+   (drag the round handle above the outline; Shift turns in 15° steps), Eraser, and weight. The ▸
+   next to each heading shows what it does.
 5. Click the black-and-white seal to inspect it up close (scroll or + and − to zoom, click to go back).
 6. **Export PDF…**
 

@@ -30,7 +30,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import QPointF, QRectF, Qt
 
 APP_NAME = "Seal Print"
-__version__ = "1.10.0"
+__version__ = "1.11.0"
 A4_W, A4_H = 210.0, 297.0           # page size, mm
 PAGE_MARGIN = 10.0                  # mm kept clear at the paper edge
 EXPORT_DPI = 1200                   # resolution of the seal image inside the PDF
@@ -865,7 +865,7 @@ PLACED_FIELDS = ("glyph_id", "name", "cx", "cy", "scale", "sq_x", "sq_y", "use_s
                  "weight", "use_weight", "ops", "use_strokes", "use_lengthen", "use_erase", "use_move", "unify",
                  "bend", "use_bend", "invert", "z")
 OP_SWITCH = {"drag": "use_strokes", "sbend": "use_strokes", "lengthen": "use_lengthen", "erase": "use_erase",
-             "move": "use_move"}
+             "move": "use_move", "turn": "use_move"}
 
 
 def lasso_mask(shape, poly, offset: float = 0.0) -> np.ndarray:
@@ -873,6 +873,25 @@ def lasso_mask(shape, poly, offset: float = 0.0) -> np.ndarray:
     pts = np.round((np.asarray(poly, np.float64).reshape(-1, 2) + offset) * 16).astype(np.int32)
     cv2.fillPoly(m, [pts.reshape(-1, 1, 2)], 1, cv2.LINE_8, 4)
     return m > 0
+
+
+def turn_points(P, centre, angle: float) -> np.ndarray:
+    """Points turned clockwise (as seen on screen) by angle degrees about centre."""
+    P = np.asarray(P, np.float64).reshape(-1, 2)
+    a = math.radians(angle)
+    ca, sa = math.cos(a), math.sin(a)
+    d = P - centre
+    return np.column_stack([centre[0] + d[:, 0] * ca - d[:, 1] * sa, centre[1] + d[:, 0] * sa + d[:, 1] * ca])
+
+
+def turn_part(g: np.ndarray, mask: np.ndarray, centre, angle: float) -> np.ndarray:
+    """Lift the ink inside a mask and put it down again turned clockwise by angle degrees about
+    centre."""
+    part = (g & mask).astype(np.float32)
+    M = cv2.getRotationMatrix2D((float(centre[0]), float(centre[1])), -float(angle), 1.0)
+    turned = cv2.warpAffine(part, M, (g.shape[1], g.shape[0]), flags=cv2.INTER_LINEAR,
+                            borderMode=cv2.BORDER_CONSTANT, borderValue=0) >= 0.5
+    return (g & ~mask) | turned
 
 
 def move_part(g: np.ndarray, mask: np.ndarray, d) -> np.ndarray:
@@ -943,6 +962,9 @@ def apply_op(g: np.ndarray, op: dict, pad: int) -> tuple[np.ndarray, np.ndarray 
     """Replay one stroke edit on a padded canvas: (canvas, the stroke afterwards, its centreline)."""
     if op["kind"] == "erase":
         return g & ~erase_mask(g.shape, op["points"], op["radius"], pad), None, None
+    if op["kind"] == "turn":
+        centre = np.asarray(op["centre"], np.float64) + pad
+        return turn_part(g, lasso_mask(g.shape, op["poly"], pad), centre, op["angle"]), None, None
     if op["kind"] == "move":
         return move_part(g, lasso_mask(g.shape, op["poly"], pad), op["d"]), None, None
     found = select_stroke(g, np.asarray(op["path"], np.float64) + pad)
@@ -3144,6 +3166,14 @@ def mm_box(lo: float, hi: float, step: float = 0.5) -> QtWidgets.QDoubleSpinBox:
 class EditorView(QtWidgets.QGraphicsView):
     """One character, large, in millimetres. Draw along a stroke to select it, drag the
     selection to pull or bend it, right-click to clear it, scroll to zoom."""
+    KNOB = 30                                          # screen pixels between the lasso outline and its turn handle
+
+    def on_knob(self, pos) -> bool:
+        """Whether a point of the viewport is on the turn handle."""
+        if not self.knob.isVisible():
+            return False
+        c = self.mapFromScene(self.knob.pos())
+        return math.hypot(pos.x() - c.x(), pos.y() - (c.y() - self.KNOB)) <= 11
 
     def __init__(self, editor):
         super().__init__()
@@ -3177,6 +3207,18 @@ class EditorView(QtWidgets.QGraphicsView):
         pen.setCosmetic(True)
         self.lasso = self.scene().addPath(QtGui.QPainterPath(), pen)
         self.lasso.setZValue(3)
+        self.knob = QtWidgets.QGraphicsItemGroup()      # turn handle: drawn in screen pixels at any zoom
+        self.knob.setFlag(QtWidgets.QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations)
+        stem = QtWidgets.QGraphicsLineItem(0, 0, 0, -self.KNOB + 7)
+        stem.setPen(QtGui.QPen(QtGui.QColor(CINNABAR), 1.2, Qt.PenStyle.DashLine))
+        dot = QtWidgets.QGraphicsEllipseItem(-7, -self.KNOB - 7, 14, 14)
+        dot.setBrush(QtGui.QColor("#ffffff"))
+        dot.setPen(QtGui.QPen(QtGui.QColor(CINNABAR), 1.8))
+        self.knob.addToGroup(stem)
+        self.knob.addToGroup(dot)
+        self.knob.setZValue(6)
+        self.scene().addItem(self.knob)
+        self.knob.hide()
         pen = QtGui.QPen(QtGui.QColor(CINNABAR), 1.5)
         pen.setCosmetic(True)
         self.brush = self.scene().addEllipse(QRectF(), pen)
@@ -3211,11 +3253,17 @@ class EditorView(QtWidgets.QGraphicsView):
         if e.button() != Qt.MouseButton.LeftButton:
             return super().mousePressEvent(e)
         self.pressed = True
+        if self.on_knob(e.position()):
+            self.editor.press_knob(self.mapToScene(e.position().toPoint()))
+            return
         self.editor.press(self.mapToScene(e.position().toPoint()))
 
     def mouseMoveEvent(self, e):
         pt = self.mapToScene(e.position().toPoint())
         self.editor.hover(pt)
+        if not self.pressed:
+            self.viewport().setCursor(Qt.CursorShape.PointingHandCursor if self.on_knob(e.position())
+                                      else Qt.CursorShape.CrossCursor)
         if self.pressed:
             self.editor.move(pt)
         else:
@@ -3241,6 +3289,37 @@ def _slider_row(s: QtWidgets.QSlider, label: QtWidgets.QLabel) -> QtWidgets.QHBo
     label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
     row.addWidget(label)
     return row
+
+
+def explained_section(layout: QtWidgets.QVBoxLayout, title: str, tip: str, about: str) -> QtWidgets.QCheckBox:
+    """A section heading with a small ▸ that shows or hides its description (hidden to begin
+    with) and an "Original" switch on the right. Returns the switch."""
+    row = QtWidgets.QHBoxLayout()
+    row.setSpacing(2)
+    row.addWidget(section_label(title))
+    more = QtWidgets.QToolButton()
+    more.setObjectName("disclose")
+    more.setText("▸")
+    more.setCheckable(True)
+    more.setAutoRaise(True)
+    more.setToolTip("Show what this does")
+    more.setCursor(Qt.CursorShape.PointingHandCursor)
+    row.addWidget(more, 0, Qt.AlignmentFlag.AlignBottom)
+    row.addStretch(1)
+    box = QtWidgets.QCheckBox("Original")
+    box.setToolTip(tip)
+    row.addWidget(box, 0, Qt.AlignmentFlag.AlignBottom)
+    layout.addLayout(row)
+    text = muted_label(about)
+    text.hide()
+    layout.addWidget(text)
+
+    def toggle(on: bool):
+        text.setVisible(on)
+        more.setText("▾" if on else "▸")
+        more.setToolTip("Hide the description" if on else "Show what this does")
+    more.toggled.connect(toggle)
+    return box
 
 
 def section_with_original(title: str, tip: str) -> tuple[QtWidgets.QHBoxLayout, QtWidgets.QCheckBox]:
@@ -3286,6 +3365,7 @@ class CharacterEditor(QtWidgets.QDialog):
         self.erase_pts: list = []
         self.erase_live = None
         self.lasso_poly = self.move_from = self.move_mask = self.move_d = None
+        self.turn = None                       # while the lasso part is being turned: pivot, start angle, angle
         self.lasso_pts: list = []
         outer = QtWidgets.QHBoxLayout(self)
         outer.setSpacing(12)
@@ -3332,23 +3412,22 @@ class CharacterEditor(QtWidgets.QDialog):
         f.addRow("Vertical", _slider_row(self.sld_sq_v, self.lbl_sq_v))
         sv.addLayout(f)
 
-        row, self.orig_bend = section_with_original("Bend", "Show the character without the bend")
-        sv.addLayout(row)
-        sv.addWidget(muted_label("Bends the whole character like a bridge: right arches it up from its bottom "
-                                 "corners (a straight line becomes ∩ at the end), left sags it down from its "
-                                 "top corners (∪)."))
+        self.orig_bend = explained_section(
+            sv, "Bend", "Show the character without the bend",
+            "Bends the whole character like a bridge: right arches it up from its bottom corners (a straight line "
+            "becomes ∩ at the end), left sags it down from its top corners (∪).")
         self.sld_bend = slider(-100, 100, "Right: arch up (∩) from the bottom corners. Left: sag down (∪) "
                                           "from the top corners")
         self.lbl_bend = QtWidgets.QLabel()
         sv.addLayout(_slider_row(self.sld_bend, self.lbl_bend))
 
-        row, self.orig_strokes = section_with_original("Strokes", "Show the strokes without the ones you pulled or bent")
-        sv.addLayout(row)
-        sv.addWidget(muted_label("1. Draw along a stroke, or along just the part you want to change.\n"
-                                 "2. Drag any point of the red selection: along the stroke to stretch it, sideways "
-                                 "to bend it. Wherever it is attached to the rest of the character stays put, so "
-                                 "nothing breaks off.\n"
-                                 "Right-click clears the selection."))
+        self.orig_strokes = explained_section(
+            sv, "Strokes", "Show the strokes without the ones you pulled or bent",
+            "1. Draw along a stroke, or along just the part you want to change.\n"
+            "2. Drag any point of the red selection: along the stroke to stretch it, sideways to bend it, or use the "
+            "Bend slider to arch it. Wherever it is attached to the rest of the character stays put, so nothing "
+            "breaks off.\n"
+            "Right-click clears the selection.")
         bend_row = QtWidgets.QHBoxLayout()
         bend_row.addWidget(QtWidgets.QLabel("Bend"))
         self.sld_sbend = slider(-100, 100, "Bends the selected stroke like a bridge: its ends and wherever it is "
@@ -3366,21 +3445,21 @@ class CharacterEditor(QtWidgets.QDialog):
         row.addWidget(self.btn_restart)
         sv.addLayout(row)
 
-        row, self.orig_lengthen = section_with_original("Lengthen", "Show the strokes without the lengthening")
-        sv.addLayout(row)
-        sv.addWidget(muted_label("Makes the selected stroke longer at its free end. Its curve, thickness and tip "
-                                 "stay the same."))
+        self.orig_lengthen = explained_section(
+            sv, "Lengthen", "Show the strokes without the lengthening",
+            "Makes the selected stroke longer at its free end. Its curve, thickness and tip stay the same.")
         self.sld_len = slider(0, 100, "How much longer the selected stroke gets")
         self.lbl_len = QtWidgets.QLabel()
         sv.addLayout(_slider_row(self.sld_len, self.lbl_len))
 
-        row, self.orig_move = section_with_original("Move", "Show the character without the parts you moved")
-        sv.addLayout(row)
-        sv.addWidget(muted_label("Pick Lasso above the character, draw around a part, then drag it."))
+        self.orig_move = explained_section(
+            sv, "Lasso", "Show the character without the parts you moved or turned",
+            "Pick Lasso above the character and draw around a part. Drag inside the outline to move it, or drag "
+            "the round handle above it to turn it (hold Shift to turn in 15° steps).")
 
-        row, self.orig_erase = section_with_original("Eraser", "Show the character without what you erased")
-        sv.addLayout(row)
-        sv.addWidget(muted_label("Pick Eraser above the character, then paint over ink to erase it."))
+        self.orig_erase = explained_section(
+            sv, "Eraser", "Show the character without what you erased",
+            "Pick Eraser above the character, then paint over ink to erase it.")
 
         row, self.orig_weight = section_with_original("Weight", "Show the strokes at their original weight")
         sv.addLayout(row)
@@ -3496,8 +3575,9 @@ class CharacterEditor(QtWidgets.QDialog):
         elif self.tool == "erase":
             self.hint.setText("Paint over ink to erase it. Ctrl+Z undoes.")
         elif self.tool == "lasso":
-            self.hint.setText("Drag inside the outline to move that part, or draw a new outline."
-                              if self.lasso_poly is not None else "Draw around the part you want to move.")
+            self.hint.setText("Drag inside the outline to move that part, drag the round handle to turn it, or "
+                              "draw a new outline." if self.lasso_poly is not None
+                              else "Draw around the part you want to move or turn.")
         elif self.sel is None and self.drag is None:
             self.hint.setText("Draw along a stroke, or along just the part of it you want to change, to select it.")
 
@@ -3582,6 +3662,14 @@ class CharacterEditor(QtWidgets.QDialog):
 
         self.view.lasso.setPath(line_path(poly, closed=True) if poly is not None and len(poly) > 2
                                 else QtGui.QPainterPath())
+        if (self.tool == "lasso" and self.lasso_poly is not None and canvas is None and self.turn is None
+                and self.editable()):
+            lo, hi = self.lasso_poly.min(axis=0), self.lasso_poly.max(axis=0)
+            top = bend.forward([((lo[0] + hi[0]) / 2, lo[1])])[0]
+            self.view.knob.setPos(top[0] * sx, top[1] * sy)
+            self.view.knob.show()
+        else:
+            self.view.knob.hide()
         bent, bx, by = bend.warp(g)
         shown = thicken(bent, w.weight, max(w.src.shape)) if w.use_weight else bent
         H, W = shown.shape
@@ -3670,6 +3758,10 @@ class CharacterEditor(QtWidgets.QDialog):
             self.view.trace.setPath(p)
 
     def move(self, pt):
+        if self.turn is not None:
+            self._turn_to(pt)
+            self.timer.start()
+            return
         if self.move_from is not None:
             self.move_d = self.to_canvas(pt) - self.move_from
             self.timer.start()
@@ -3700,6 +3792,20 @@ class CharacterEditor(QtWidgets.QDialog):
             self.view.trace.setPath(p)
 
     def release(self, pt):
+        if self.turn is not None:
+            self.timer.stop()
+            self._turn_to(pt)
+            t, self.turn = self.turn, None
+            if abs(t["angle"]) >= 0.5:
+                op = {"kind": "turn", "poly": (self.lasso_poly - self.pad).round(2).tolist(),
+                      "centre": [round(float(v - self.pad), 2) for v in t["pivot"]], "angle": round(t["angle"], 2)}
+                self.remember()
+                self.canvas = apply_op(self.canvas, op, self.pad)[0]
+                self.work.ops.append(op)
+                self.lasso_poly = turn_points(self.lasso_poly, t["pivot"], t["angle"])   # the outline turns too
+            self.update_controls()
+            self.refresh()
+            return
         if self.move_from is not None:
             d = self.to_canvas(pt) - self.move_from
             self.timer.stop()
@@ -3763,8 +3869,35 @@ class CharacterEditor(QtWidgets.QDialog):
         self.update_controls()
         self.refresh()
 
+    def press_knob(self, pt):
+        """Start turning the part inside the lasso outline about the outline's middle."""
+        if self.lasso_poly is None or not self.editable():
+            return
+        b = self.to_canvas(pt)
+        lo, hi = self.lasso_poly.min(axis=0), self.lasso_poly.max(axis=0)
+        pivot = (lo + hi) / 2
+        self.turn = {"pivot": pivot, "from": math.atan2(b[1] - pivot[1], b[0] - pivot[0]), "angle": 0.0,
+                     "mask": lasso_mask(self.canvas.shape, self.lasso_poly)}
+        self.view.knob.hide()
+        self.hint.setText("Drag round to turn the part. Hold Shift to turn in 15° steps.")
+
+    def _turn_to(self, pt):
+        b = self.to_canvas(pt)
+        t = self.turn
+        a = math.degrees(math.atan2(b[1] - t["pivot"][1], b[0] - t["pivot"][0]) - t["from"])
+        a = (a + 180.0) % 360.0 - 180.0
+        if QtWidgets.QApplication.keyboardModifiers() & Qt.KeyboardModifier.ShiftModifier:
+            a = 15.0 * round(a / 15.0)
+        t["angle"] = a
+        self.hint.setText(f"Turned {a:+.0f}°" + ("" if a % 15 == 0 else ". Hold Shift to turn in 15° steps."))
+
     def _preview(self):
-        if self.move_from is not None and self.move_d is not None:
+        if self.turn is not None:
+            t = self.turn
+            turned = turn_part(self.canvas, t["mask"], t["pivot"], t["angle"])
+            poly = turn_points(self.lasso_poly, t["pivot"], t["angle"])
+            self.refresh(turned, turned & lasso_mask(turned.shape, poly), None, poly=poly)
+        elif self.move_from is not None and self.move_d is not None:
             moved = move_part(self.canvas, self.move_mask, self.move_d)
             poly = self.lasso_poly + self.move_d
             self.refresh(moved, moved & lasso_mask(moved.shape, poly), None, poly=poly)
@@ -4958,6 +5091,8 @@ QPushButton:focus, QToolButton:focus {{ border-color: {c['accent_label']}; }}
 QPushButton:disabled, QToolButton:disabled {{ color: {c['dis_text']}; background: {c['dis_bg']};
     border-color: {c['dis_border']}; }}
 QToolButton#themebtn {{ padding: 4px; }}
+QToolButton#disclose {{ background: transparent; border: none; color: {c['muted']}; padding: 0px 3px; }}
+QToolButton#disclose:hover, QToolButton#disclose:checked {{ color: {c['text']}; background: transparent; }}
 QToolButton#themebtn::menu-indicator {{ image: none; width: 0; }}
 QPushButton:checked {{ background: {c['item_sel']}; border-color: {c['accent']}; color: {c['text']}; }}
 QPushButton#primary {{ background: {c['accent']}; color: {c['on_accent']}; border: 1px solid {c['accent']};
