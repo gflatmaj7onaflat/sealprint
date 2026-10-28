@@ -30,7 +30,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import QPointF, QRectF, Qt
 
 APP_NAME = "Seal Print"
-__version__ = "1.11.0"
+__version__ = "1.12.0"
 A4_W, A4_H = 210.0, 297.0           # page size, mm
 PAGE_MARGIN = 10.0                  # mm kept clear at the paper edge
 EXPORT_DPI = 1200                   # resolution of the seal image inside the PDF
@@ -380,7 +380,7 @@ def _bspline_matrix(u: np.ndarray, knots: np.ndarray, k: int = 3) -> np.ndarray:
     return B
 
 
-def _fit_open(pts: np.ndarray, spacing: float) -> np.ndarray:
+def _fit_open(pts: np.ndarray, spacing: float, pin: float = 1e3) -> np.ndarray:
     """Least-squares cubic B-spline through an open run of outline points, ends kept in place."""
     n = len(pts)
     m = max(1, int(round((n - 1) / spacing)))          # spans
@@ -390,7 +390,7 @@ def _fit_open(pts: np.ndarray, spacing: float) -> np.ndarray:
     u = np.linspace(0, 1, n)
     A = _bspline_matrix(u, knots)
     w = np.ones(n)
-    w[[0, -1]] = 1e3                                  # pin the corners
+    w[[0, -1]] = pin                                  # pin the ends (firmly unless asked otherwise)
     P, *_ = np.linalg.lstsq(A * w[:, None], pts * w[:, None], rcond=None)
     return A @ P
 
@@ -853,6 +853,7 @@ class Placed:
     use_lengthen: bool = True
     use_erase: bool = True
     use_move: bool = True
+    use_draw: bool = True
     bend: float = 0.0                # bend like a bridge: 1 turns the bottom edge into ∩, -1 the top into ∪
     use_bend: bool = True
     unify: bool = False              # any white-text (陰文) parts drawn as red text (朱文)
@@ -862,10 +863,11 @@ class Placed:
 
 
 PLACED_FIELDS = ("glyph_id", "name", "cx", "cy", "scale", "sq_x", "sq_y", "use_squish", "crop", "use_crop",
-                 "weight", "use_weight", "ops", "use_strokes", "use_lengthen", "use_erase", "use_move", "unify",
+                 "weight", "use_weight", "ops", "use_strokes", "use_lengthen", "use_erase", "use_move", "use_draw",
+                 "unify",
                  "bend", "use_bend", "invert", "z")
 OP_SWITCH = {"drag": "use_strokes", "sbend": "use_strokes", "lengthen": "use_lengthen", "erase": "use_erase",
-             "move": "use_move", "turn": "use_move"}
+             "move": "use_move", "turn": "use_move", "draw": "use_draw"}
 
 
 def lasso_mask(shape, poly, offset: float = 0.0) -> np.ndarray:
@@ -873,6 +875,199 @@ def lasso_mask(shape, poly, offset: float = 0.0) -> np.ndarray:
     pts = np.round((np.asarray(poly, np.float64).reshape(-1, 2) + offset) * 16).astype(np.int32)
     cv2.fillPoly(m, [pts.reshape(-1, 1, 2)], 1, cv2.LINE_8, 4)
     return m > 0
+
+
+def draw_stroke(g: np.ndarray, points, width: float, closed: bool = False) -> np.ndarray:
+    """Ink a drawn stroke onto g: an even line `width` pixels thick along `points`, its ends
+    rounded and a little slimmer just before the tip, like the iron-wire seal script (鐵線篆).
+    A closed stroke has no ends and is even all the way round."""
+    pts = np.asarray(points, np.float64).reshape(-1, 2)
+    if closed and len(pts) > 2:
+        pts = np.vstack([pts, pts[:1]])
+    pts = _resample(pts, 0.75) if len(pts) > 1 else pts
+    if not len(pts):
+        return g
+    s = np.r_[0.0, np.cumsum(np.hypot(*np.diff(pts, axis=0).T))] if len(pts) > 1 else np.zeros(1)
+    if closed:
+        w = np.full(len(pts), float(width))
+    else:
+        tip = np.clip(np.minimum(s, s[-1] - s) / (1.2 * width), 0.0, 1.0)
+        w = width * (0.75 + 0.25 * tip * tip * (3 - 2 * tip))     # slimmer towards each rounded tip
+    m = np.zeros(g.shape, np.uint8)
+    for (x, y), wi in zip(pts, w):
+        cv2.circle(m, (int(round(x * 16)), int(round(y * 16))), max(8, int(round(wi * 8))), 1, -1, cv2.LINE_8, 4)
+    return g | (m > 0)
+
+
+def _fit_circle(P: np.ndarray) -> tuple[np.ndarray, float, float]:
+    """Least-squares circle through points: (centre, radius, rms distance from it)."""
+    x, y = P[:, 0], P[:, 1]
+    A = np.column_stack([x, y, np.ones(len(P))])
+    sol, *_ = np.linalg.lstsq(A, x * x + y * y, rcond=None)
+    c = np.array([sol[0] / 2, sol[1] / 2])
+    r = math.sqrt(max(sol[2] + c @ c, 1e-9))
+    return c, r, float(np.sqrt(np.mean((np.hypot(x - c[0], y - c[1]) - r) ** 2)))
+
+
+def _snap_level(a: np.ndarray, b: np.ndarray, degrees: float = 4.0):
+    """A line nearly level or upright, made exactly so about its middle."""
+    d = b - a
+    ang = math.degrees(math.atan2(d[1], d[0])) % 180.0
+    mid, half = (a + b) / 2, float(np.hypot(*d)) / 2
+    for target, unit in ((0.0, (1, 0)), (180.0, (1, 0)), (90.0, (0, 1))):
+        if abs(ang - target) <= degrees:
+            u = np.array(unit, np.float64) * (1 if d @ np.array(unit) >= 0 else -1)
+            return mid - u * half, mid + u * half
+    return a, b
+
+
+def _guess_piece(Q: np.ndarray, width: float, wobble: float = 0.0, trim=(False, False)) -> np.ndarray:
+    """One stretch of a drawn path, tidied: a straight line, a circular arc, or a smooth curve.
+    `wobble` is how unsteady the hand was; `trim` says which ends meet a corner, where the drawn
+    path rounds off and shouldn't count against a straight line or an arc."""
+    L = float(np.hypot(*np.diff(Q, axis=0).T).sum())
+    k = max(1, min(len(Q) // 6, int(round(1.5 * width / 1.5))))
+    core = Q[k if trim[0] else 0:len(Q) - k if trim[1] else len(Q)]
+    if len(core) < 3:
+        core = Q
+    mid = core.mean(axis=0)
+    _, _, vt = np.linalg.svd(core - mid, full_matrices=False)
+    u, n = vt[0], vt[1]
+    if np.abs((core - mid) @ n).max() <= max(1.5, 0.04 * L, 3.0 * wobble):   # straight enough: a line
+        a, b = mid + ((Q[0] - mid) @ u) * u, mid + ((Q[-1] - mid) @ u) * u
+        a, b = _snap_level(a, b)
+        return np.vstack([a, b])
+    c, r, rms = _fit_circle(core)
+    if rms <= max(0.04 * r, 1.5 * wobble) and r <= 2.5 * L:      # part of a circle: an arc
+        ang = np.unwrap(np.arctan2(Q[:, 1] - c[1], Q[:, 0] - c[0]))
+        m = max(8, int(abs(ang[-1] - ang[0]) * r / 2))
+        t = np.linspace(ang[0], ang[-1], m)
+        return np.column_stack([c[0] + r * np.cos(t), c[1] + r * np.sin(t)])
+    R = _resample(Q, 1.0)                                         # anything else: a smooth curve, its ends held
+    return _fit_open(R, max(3.0 * width, L / 8), pin=3.0)         # only lightly so the hand's wobble leaves no hook
+
+
+def guess_stroke(points, width: float) -> tuple[np.ndarray, bool]:
+    """Best guess at the stroke a hand-drawn path means: (centreline points, closed). Nearly
+    straight becomes a line (level or upright if it nearly is), part of a circle an arc, a loop
+    back to the start a circle, ellipse or smooth closed curve, anything else a smooth curve.
+    A path with sharp corners is split at them and each stretch is guessed on its own."""
+    P = _resample(np.asarray(points, np.float64).reshape(-1, 2), 1.5)
+    if len(P) < 4:
+        return P, False
+    L = float(np.hypot(*np.diff(P, axis=0).T).sum())
+    if float(np.hypot(*(P[-1] - P[0]))) <= max(2.5 * width, 0.12 * L) and L >= 6 * width:   # a loop
+        ring = P[:-1] if np.allclose(P[0], P[-1]) else P
+        c, r, rms = _fit_circle(ring)
+        if rms <= 0.07 * r:
+            k = max(32, int(2 * math.pi * r / 2))
+            t = np.linspace(0, 2 * math.pi, k, endpoint=False)
+            return np.column_stack([c[0] + r * np.cos(t), c[1] + r * np.sin(t)]), True
+        if len(ring) >= 5:
+            (ex, ey), (ma, mb), ang = cv2.fitEllipse(ring.astype(np.float32))
+            t = np.linspace(0, 2 * math.pi, 180, endpoint=False)
+            ca, sa = math.cos(math.radians(ang)), math.sin(math.radians(ang))
+            E = np.column_stack([ma / 2 * np.cos(t), mb / 2 * np.sin(t)])
+            E = np.column_stack([ex + E[:, 0] * ca - E[:, 1] * sa, ey + E[:, 0] * sa + E[:, 1] * ca])
+            gap = np.min(np.hypot(ring[:, None, 0] - E[None, :, 0], ring[:, None, 1] - E[None, :, 1]), axis=1)
+            if np.sqrt(np.mean(gap ** 2)) <= 0.06 * (ma + mb) / 2:
+                return E, True
+        return _fit_closed(_resample(np.vstack([ring, ring[:1]]), 1.0)[:-1], max(3.0 * width, L / 8)), True
+    reach = max(3, int(round(max(2.0 * width, 0.05 * L) / 1.5)))
+    k = max(1, reach // 3)                                        # corners are looked for on a steadied copy,
+    pad = np.vstack([np.repeat(P[:1], k, 0), P, np.repeat(P[-1:], k, 0)])   # so the mouse's wobbles don't count
+    steady = np.column_stack([np.convolve(pad[:, j], np.ones(2 * k + 1) / (2 * k + 1), mode="valid") for j in (0, 1)])
+    near, far = _turning_open(steady, reach), _turning_open(steady, 2 * reach)
+    # a corner turns sharply and stays that sharp looked at from twice as far; a smooth bend keeps
+    # turning more the further you look, and a wobble turns less
+    turn = np.where((far >= 0.75 * near) & (far <= 1.35 * near + 0.05), near, 0.0)
+    cuts = [i for i in range(reach, len(P) - reach) if turn[i] >= math.radians(62) and turn[i] == turn[max(0, i - reach):i + reach + 1].max()]
+    keep = []
+    for i in cuts:
+        if not keep or i - keep[-1] > reach:
+            keep.append(i)
+    wobble = float(np.sqrt(np.mean(np.sum((P - steady) ** 2, axis=1))))
+    if keep:                                                      # a corner joins pieces heading clearly apart:
+        bounds = [0] + keep + [len(P) - 1]                        # fit the pieces either side and compare their
+        fitted = [_guess_piece(P[i:j + 1], width, wobble, (i > 0, j < len(P) - 1))   # directions where they meet
+                  for i, j in zip(bounds, bounds[1:])]
+
+        def heading(q, at_end):
+            q = _resample(q, 1.0) if len(q) > 2 else q
+            k = min(len(q) - 1, max(1, int(round(width))))
+            d = (q[-1] - q[-1 - k]) if at_end else (q[k] - q[0])
+            return d / max(float(np.hypot(*d)), 1e-9)
+
+        # a doubtful turn (under 75°) is only a corner between two straight pieces; a curve can bend
+        # that tightly without having one
+        keep = [c for c, a, b in zip(keep, fitted, fitted[1:])
+                if math.degrees(math.acos(float(np.clip(heading(a, True) @ heading(b, False), -1, 1)))) >= 45
+                and (turn[c] >= math.radians(75) or (len(a) == 2 and len(b) == 2))]
+    bounds = [0] + keep + [len(P) - 1]
+    parts = [_guess_piece(P[i:j + 1], width, wobble, (i > 0, j < len(P) - 1))
+             for i, j in zip(bounds, bounds[1:]) if j - i >= 2]
+    if not parts:
+        return P, False
+    out = [parts[0].copy()]
+    for q in parts[1:]:                                           # pieces meet at their corner
+        q = q.copy()
+        corner = (out[-1][-1] + q[0]) / 2
+        if len(out[-1]) == 2 and len(q) == 2:                     # two straight lines: exactly where they cross
+            d1, d2 = out[-1][1] - out[-1][0], q[1] - q[0]
+            det = d1[0] * d2[1] - d1[1] * d2[0]
+            if abs(det) > 1e-9:
+                t1 = ((q[0][0] - out[-1][0][0]) * d2[1] - (q[0][1] - out[-1][0][1]) * d2[0]) / det
+                x = out[-1][0] + t1 * d1
+                if np.hypot(*(x - corner)) <= 3 * width:
+                    corner = x
+        out[-1][-1] = corner
+        q[0] = corner
+        out.append(q[1:])
+    return np.vstack(out), False
+
+
+def stroke_kind(line: np.ndarray, closed: bool) -> str:
+    """What a guessed stroke turned out to be, in words."""
+    if closed:
+        return "a circle" if _fit_circle(line)[2] < 0.5 else "a loop"
+    if len(line) == 2:
+        return "a straight line"
+    if len(line) <= 6:
+        return "straight lines with corners"
+    if len(line) > 3 and _fit_circle(line)[2] < 0.5:
+        return "an arc"
+    return "a smooth curve"
+
+
+def _turning_open(P: np.ndarray, reach: int) -> np.ndarray:
+    """How sharply an open path turns at each point, over `reach` points either side."""
+    n = len(P)
+    i = np.arange(n)
+    a = P - P[np.maximum(0, i - reach)]
+    b = P[np.minimum(n - 1, i + reach)] - P
+    t = np.abs(np.arctan2(a[:, 0] * b[:, 1] - a[:, 1] * b[:, 0], (a * b).sum(1)))
+    t[:reach] = t[-reach:] = 0.0
+    return t
+
+
+def smooth_path(points, width: float) -> np.ndarray:
+    """A freehand path with the mouse's jitter taken out, its shape otherwise kept."""
+    P = _resample(np.asarray(points, np.float64).reshape(-1, 2), 1.0)
+    k = max(1, int(round(width / 2)))
+    if len(P) < 2 * k + 3:
+        return P
+    pad = np.vstack([np.repeat(P[:1], k, 0), P, np.repeat(P[-1:], k, 0)])
+    kern = np.ones(2 * k + 1) / (2 * k + 1)
+    S = np.column_stack([np.convolve(pad[:, j], kern, mode="valid") for j in (0, 1)])
+    S[0], S[-1] = P[0], P[-1]                                     # the ends stay where they were drawn
+    return S
+
+
+def typical_width(ink: np.ndarray) -> float:
+    """A character's usual stroke width in pixels, to draw new strokes to match."""
+    dt = cv2.distanceTransform(ink.astype(np.uint8), cv2.DIST_L2, 5)
+    ridge = (dt >= cv2.dilate(dt, np.ones((3, 3), np.uint8))) & (dt > 1)
+    return 2.0 * float(np.median(dt[ridge])) if ridge.any() else max(3.0, 0.03 * max(ink.shape))
 
 
 def turn_points(P, centre, angle: float) -> np.ndarray:
@@ -962,6 +1157,9 @@ def apply_op(g: np.ndarray, op: dict, pad: int) -> tuple[np.ndarray, np.ndarray 
     """Replay one stroke edit on a padded canvas: (canvas, the stroke afterwards, its centreline)."""
     if op["kind"] == "erase":
         return g & ~erase_mask(g.shape, op["points"], op["radius"], pad), None, None
+    if op["kind"] == "draw":
+        pts = np.asarray(op["points"], np.float64) + pad
+        return draw_stroke(g, pts, float(op["width"]), bool(op.get("closed", False))), None, None
     if op["kind"] == "turn":
         centre = np.asarray(op["centre"], np.float64) + pad
         return turn_part(g, lasso_mask(g.shape, op["poly"], pad), centre, op["angle"]), None, None
@@ -3364,6 +3562,8 @@ class CharacterEditor(QtWidgets.QDialog):
         self.tool = "strokes"
         self.erase_pts: list = []
         self.erase_live = None
+        self.draw_pts: list = []               # the stroke being drawn, and how it looks so far
+        self.draw_live = None
         self.lasso_poly = self.move_from = self.move_mask = self.move_d = None
         self.turn = None                       # while the lasso part is being turned: pivot, start angle, angle
         self.lasso_pts: list = []
@@ -3375,7 +3575,8 @@ class CharacterEditor(QtWidgets.QDialog):
         tools.addWidget(QtWidgets.QLabel("Tool"))
         self.tool_buttons = {}
         for key, label, tip in (("strokes", "Strokes", "Draw along a stroke to select it, then drag it"),
-                                ("lasso", "Lasso", "Draw around part of the character, then drag it somewhere else"),
+                                ("lasso", "Lasso", "Draw around part of the character, then move or turn it"),
+                                ("draw", "Draw", "Draw new strokes with the mouse"),
                                 ("erase", "Eraser", "Paint over ink to erase it")):
             b = QtWidgets.QPushButton(label)
             b.setCheckable(True)
@@ -3386,12 +3587,38 @@ class CharacterEditor(QtWidgets.QDialog):
             self.tool_buttons[key] = b
         self.tool_buttons["strokes"].setChecked(True)
         tools.addSpacing(12)
-        tools.addWidget(QtWidgets.QLabel("Eraser size"))
+        self.erase_opts = QtWidgets.QWidget()          # the eraser's options
+        eo = QtWidgets.QHBoxLayout(self.erase_opts)
+        eo.setContentsMargins(0, 0, 0, 0)
+        eo.addWidget(QtWidgets.QLabel("Eraser size"))
         self.sld_brush = slider(1, 20, "How big the eraser is")
         self.sld_brush.setValue(4)
+        self.sld_brush.setMinimumWidth(90)
         self.sld_brush.setMaximumWidth(160)
-        tools.addWidget(self.sld_brush)
+        eo.addWidget(self.sld_brush)
+        tools.addWidget(self.erase_opts)
+        self.draw_opts = QtWidgets.QWidget()           # drawing's options
+        do = QtWidgets.QHBoxLayout(self.draw_opts)
+        do.setContentsMargins(0, 0, 0, 0)
+        do.addWidget(QtWidgets.QLabel("Thickness"))
+        self.sld_pen = slider(2, 60, "How thick new strokes are. It starts at the thickness of this character's "
+                                     "own strokes")
+        self.sld_pen.setMinimumWidth(90)
+        self.sld_pen.setMaximumWidth(140)
+        do.addWidget(self.sld_pen)
+        self.lbl_pen = QtWidgets.QLabel()
+        self.lbl_pen.setObjectName("muted")
+        self.lbl_pen.setMinimumWidth(self.lbl_pen.fontMetrics().horizontalAdvance("0.00 mm") + 4)
+        do.addWidget(self.lbl_pen)
+        do.addSpacing(8)
+        self.chk_guess = QtWidgets.QCheckBox("Guess the shape")
+        self.chk_guess.setToolTip("Tidy each stroke as you let go: nearly straight becomes a straight line, part of "
+                                  "a circle an arc, a loop a circle or ellipse, anything else a smooth curve. "
+                                  "Sharp corners are kept")
+        do.addWidget(self.chk_guess)
+        tools.addWidget(self.draw_opts)
         tools.addStretch(1)
+        self.tools_row = tools
         left.addLayout(tools)
         self.view = EditorView(self)
         left.addWidget(self.view, 1)
@@ -3457,6 +3684,14 @@ class CharacterEditor(QtWidgets.QDialog):
             "Pick Lasso above the character and draw around a part. Drag inside the outline to move it, or drag "
             "the round handle above it to turn it (hold Shift to turn in 15° steps).")
 
+        self.orig_draw = explained_section(
+            sv, "Draw", "Show the character without the strokes you drew",
+            "Pick Draw above the character and draw with the mouse. Thickness sets how thick new strokes are; it "
+            "starts at the thickness of this character's own strokes. Strokes end round and a little slimmer just "
+            "before the tip, like iron-wire seal script. With Guess the shape on, each stroke is tidied as you let "
+            "go: nearly straight becomes a straight line (level or upright if it nearly is), part of a circle an "
+            "arc, a loop a circle or ellipse, anything else a smooth curve, and sharp corners are kept.")
+
         self.orig_erase = explained_section(
             sv, "Eraser", "Show the character without what you erased",
             "Pick Eraser above the character, then paint over ink to erase it.")
@@ -3498,7 +3733,11 @@ class CharacterEditor(QtWidgets.QDialog):
         self.orig_lengthen.setChecked(not w.use_lengthen)
         self.orig_erase.setChecked(not w.use_erase)
         self.orig_move.setChecked(not w.use_move)
+        self.orig_draw.setChecked(not w.use_draw)
         self.orig_weight.setChecked(not w.use_weight)
+        pen = typical_width(self.canvas) / max(self.work.src.shape) * 400   # in quarter percents of its size
+        self.sld_pen.setValue(int(round(min(max(pen, 2), 60))))
+        self.chk_guess.setChecked(QtCore.QSettings("sealprint", "sealprint").value("draw/guess", True, type=bool))
         self._loading = False
         for s in (self.sld_sq_h, self.sld_sq_v):
             s.valueChanged.connect(self.on_squish)
@@ -3514,18 +3753,30 @@ class CharacterEditor(QtWidgets.QDialog):
         self.orig_lengthen.toggled.connect(self.on_stroke_originals)
         self.orig_erase.toggled.connect(self.on_stroke_originals)
         self.orig_move.toggled.connect(self.on_stroke_originals)
+        self.orig_draw.toggled.connect(self.on_stroke_originals)
+        self.sld_pen.valueChanged.connect(lambda _: self.update_controls())
+        self.chk_guess.toggled.connect(lambda on: (QtCore.QSettings("sealprint", "sealprint").setValue("draw/guess", on),
+                                                   self.update_controls()))
         self.btn_undo.clicked.connect(self.undo)
         self.btn_restart.clicked.connect(self.start_over)
         undo = QtGui.QShortcut(QtGui.QKeySequence(QtGui.QKeySequence.StandardKey.Undo), self)
         undo.activated.connect(self.undo)
-        fit_to_screen(self, 1040, 720)
+        self.draw_opts.show()                          # wide enough for the tool row with drawing's options
+        row_w = self.tools_row.sizeHint().width()
+        self.draw_opts.hide()
+        fit_to_screen(self, max(1040, row_w + side.sizeHint().width() + 60), 720)
         self.update_controls()
         self.on_weight()
         self.on_squish()
 
     # ---- whole-character settings and the Original switches
     def editable(self) -> bool:
-        return self.work.use_strokes and self.work.use_lengthen and self.work.use_erase and self.work.use_move
+        w = self.work
+        return w.use_strokes and w.use_lengthen and w.use_erase and w.use_move and w.use_draw
+
+    def pen_width(self) -> float:
+        """How thick a drawn stroke is, in the character's pixels."""
+        return self.sld_pen.value() / 400 * max(self.work.src.shape)
 
     def set_tool(self, tool: str):
         self.finish_lengthen()
@@ -3544,11 +3795,11 @@ class CharacterEditor(QtWidgets.QDialog):
         return self.sld_brush.value() / 100 * max(self.work.src.shape)
 
     def hover(self, pt):
-        if self.tool != "erase" or not self.editable():
+        if self.tool not in ("erase", "draw") or not self.editable():
             self.view.brush.hide()
             return
         sx, sy = char_scale(self.work)
-        r = self.brush_radius()
+        r = self.brush_radius() if self.tool == "erase" else self.pen_width() / 2
         self.view.brush.setRect(QRectF(pt.x() - r * sx, pt.y() - r * sy, 2 * r * sx, 2 * r * sy))
         self.view.brush.show()
 
@@ -3570,8 +3821,16 @@ class CharacterEditor(QtWidgets.QDialog):
         arrow = ("↑" if v > 0 else "↓") if lying else ("←" if v > 0 else "→")
         self.lbl_sbend.setText(f"{arrow} {abs(v)}%" if v else "0%")
         self.sld_brush.setEnabled(self.tool == "erase" and self.editable())
+        self.erase_opts.setVisible(self.tool == "erase")
+        self.draw_opts.setVisible(self.tool == "draw")
+        self.draw_opts.setEnabled(self.editable())
+        self.lbl_pen.setText(f"{self.pen_width() * self.work.scale:.2f} mm")
         if not self.editable():
-            self.hint.setText("Turn off Original under Strokes, Lengthen, Move and Eraser to change strokes.")
+            self.hint.setText("Turn off Original under Strokes, Lengthen, Lasso, Draw and Eraser to change strokes.")
+        elif self.tool == "draw":
+            self.hint.setText("Draw with the mouse. Each stroke is tidied into a line, arc, circle or smooth curve "
+                              "as you let go." if self.chk_guess.isChecked()
+                              else "Draw with the mouse. Strokes stay as you draw them, just steadied.")
         elif self.tool == "erase":
             self.hint.setText("Paint over ink to erase it. Ctrl+Z undoes.")
         elif self.tool == "lasso":
@@ -3615,6 +3874,7 @@ class CharacterEditor(QtWidgets.QDialog):
         self.work.use_lengthen = not self.orig_lengthen.isChecked()
         self.work.use_erase = not self.orig_erase.isChecked()
         self.work.use_move = not self.orig_move.isChecked()
+        self.work.use_draw = not self.orig_draw.isChecked()
         QtWidgets.QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
             self.canvas = edit_canvas(self.work)       # replay only the edits that are switched on
@@ -3738,6 +3998,11 @@ class CharacterEditor(QtWidgets.QDialog):
             self.erase_live = erase_mask(self.canvas.shape, [b], self.brush_radius())
             self.refresh(self.canvas & ~self.erase_live, None, None)
             return
+        if self.tool == "draw":
+            self.draw_pts = [b]
+            self.draw_live = erase_mask(self.canvas.shape, [b], self.pen_width() / 2)
+            self.refresh(self.canvas | self.draw_live, None, None)
+            return
         if self.sel is not None and self.near_selection(b):
             QtWidgets.QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
             try:
@@ -3771,6 +4036,16 @@ class CharacterEditor(QtWidgets.QDialog):
             path = self.view.trace.path()
             path.lineTo(pt)
             self.view.trace.setPath(path)
+            return
+        if self.draw_pts:
+            b = self.to_canvas(pt)
+            r = max(1, int(round(self.pen_width() / 2)))
+            m = self.draw_live.view(np.uint8)
+            a = np.round(self.draw_pts[-1]).astype(int)
+            cv2.line(m, (int(a[0]), int(a[1])), (int(round(b[0])), int(round(b[1]))), 1, 2 * r + 1)
+            cv2.circle(m, (int(round(b[0])), int(round(b[1]))), r, 1, -1)
+            self.draw_pts.append(b)
+            self.timer.start()
             return
         if self.erase_pts:
             b = self.to_canvas(pt)
@@ -3826,6 +4101,26 @@ class CharacterEditor(QtWidgets.QDialog):
             ok = len(pts) > 3 and np.ptp(pts[:, 0]) > 3 and np.ptp(pts[:, 1]) > 3
             self.lasso_poly = pts if ok else None
             self.update_controls()
+            self.refresh()
+            return
+        if self.draw_pts:
+            self.timer.stop()
+            pts, w = np.asarray(self.draw_pts, np.float64), self.pen_width()
+            self.draw_pts, self.draw_live = [], None
+            if float(np.hypot(*np.diff(pts, axis=0).T).sum()) < 1.0:     # a click: a dot
+                line, closed, what = pts[:1], False, "a dot"
+            elif self.chk_guess.isChecked():
+                line, closed = guess_stroke(pts, w)
+                what = stroke_kind(line, closed)
+            else:
+                line, closed, what = smooth_path(pts, w), False, "a stroke"
+            op = {"kind": "draw", "points": (line - self.pad).round(2).tolist(), "width": round(w, 2),
+                  "closed": bool(closed)}
+            self.remember()
+            self.canvas = apply_op(self.canvas, op, self.pad)[0]
+            self.work.ops.append(op)
+            self.update_controls()
+            self.hint.setText(f"Drew {what}. Ctrl+Z undoes it.")
             self.refresh()
             return
         if self.erase_pts:
@@ -3903,6 +4198,8 @@ class CharacterEditor(QtWidgets.QDialog):
             self.refresh(moved, moved & lasso_mask(moved.shape, poly), None, poly=poly)
         elif self.erase_live is not None:
             self.refresh(self.canvas & ~self.erase_live, None, None)
+        elif self.draw_live is not None:
+            self.refresh(self.canvas | self.draw_live, None, None)
         elif self.drag is not None and self.pending is not None:
             self.refresh(*self.drag.apply(self.pending))
 
@@ -4014,7 +4311,7 @@ class CharacterEditor(QtWidgets.QDialog):
         self.finish_lengthen()
         p, w = self.orig, self.work
         for k in ("sq_x", "sq_y", "use_squish", "weight", "use_weight", "ops", "use_strokes", "use_lengthen",
-                  "use_erase", "use_move", "invert", "bend", "use_bend"):
+                  "use_erase", "use_move", "use_draw", "invert", "bend", "use_bend"):
             setattr(p, k, getattr(w, k))
         p.cache = None
         super().accept()

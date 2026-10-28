@@ -590,3 +590,52 @@ def test_turning_a_lasso_part_about_its_middle():
     assert img.shape[0] > img.shape[1]                   # replayed: the character is tall now
     p.use_move = False
     assert sp.process_char(p)[0].shape[1] > sp.process_char(p)[0].shape[0]   # Original: lying again
+
+
+# ───────────────────────────── drawing new strokes
+
+def test_drawn_strokes_are_even_with_round_slimmer_tips():
+    g = sp.draw_stroke(np.zeros((200, 400), bool), [(50, 100), (350, 100)], 20)
+    assert g[80:121, 200].sum() in (20, 21)              # even in the middle
+    assert 14 <= g[80:121, 50].sum() <= 17               # a little slimmer at the tip
+    assert g[100, 43:50].all() and not g[100, 41]        # rounded off just past the end point
+    assert g[80:121, 45].sum() < g[80:121, 50].sum()     # (narrowing as it rounds)
+    ring = sp.draw_stroke(np.zeros((300, 300), bool), sp.guess_stroke(
+        [(150 + 80 * np.cos(a), 150 + 80 * np.sin(a)) for a in np.linspace(0, 6.1, 60)], 12)[0], 12, closed=True)
+    assert pieces(ring) == 1 and not ring[150, 150]      # a closed ring, even all round
+
+
+def test_guessing_what_a_wobbly_stroke_means():
+    rng = np.random.default_rng(3)
+    wob = lambda P: np.asarray(P, float) + rng.normal(0, 1.9, np.shape(P))
+    t = np.linspace(0, 1, 90)
+    line, closed = sp.guess_stroke(wob(np.column_stack([60 + 220 * t, 70 + 6 * t])), 9)
+    assert len(line) == 2 and line[0][1] == line[1][1] and not closed            # level, exactly
+    a = np.pi * (1.1 + 0.8 * t)
+    arc, _ = sp.guess_stroke(wob(np.column_stack([170 + 80 * np.cos(a), 230 + 80 * np.sin(a)])), 9)
+    c, r, rms = sp._fit_circle(arc)
+    assert rms < 0.5 and abs(r - 80) < 6 and sp.stroke_kind(arc, False) == "an arc"
+    c2 = 2 * np.pi * np.linspace(0, 0.96, 110)
+    ring, closed = sp.guess_stroke(wob(np.column_stack([300 + 60 * np.cos(c2), 300 + 60 * np.sin(c2)])), 9)
+    assert closed and sp.stroke_kind(ring, True) == "a circle"
+    seg = lambda p, q, k: np.column_stack([np.linspace(p[0], q[0], k), np.linspace(p[1], q[1], k)])
+    ell, _ = sp.guess_stroke(wob(seg((100, 100), (100, 300), 50).tolist() + seg((104, 300), (300, 300), 50).tolist()), 9)
+    assert len(ell) == 3 and np.allclose(ell[1], (ell[0][0], ell[2][1]))       # an L: two lines, a crisp corner
+    s_curve, _ = sp.guess_stroke(wob(np.column_stack([330 + 190 * t, 300 + 45 * np.sin(2 * np.pi * t)])), 9)
+    d = np.diff(s_curve, axis=0)
+    h = np.degrees(np.arctan2(d[:, 1], d[:, 0]))
+    assert np.abs((np.diff(h) + 180) % 360 - 180).max() < 10                    # an S stays one smooth curve
+
+
+def test_drawn_strokes_replay_and_switch_off():
+    g = np.zeros((300, 300), bool)
+    g[140:160, 40:260] = True
+    p = sp.Placed("y", "一", g, cx=10, cy=10, scale=0.05)
+    plain = sp.process_char(p)[0].copy()
+    p.ops = [{"kind": "draw", "points": [[150, 40], [150, 260]], "width": 20, "closed": False}]
+    p.cache = None
+    drawn = sp.process_char(p)[0]
+    assert drawn.shape[0] > plain.shape[0]               # an upright stroke added: the character is taller
+    p.use_draw = False
+    assert (sp.process_char(p)[0] == plain).all()
+    assert abs(sp.typical_width(g) - 20) <= 2            # new strokes start as thick as the character's own

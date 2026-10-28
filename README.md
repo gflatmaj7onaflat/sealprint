@@ -40,7 +40,13 @@ physical size on A4, ready to transfer onto a seal stone.
   dough, bend it into an arch with a slider, or lengthen it at its free end. Strokes keep their
   thickness, and wherever a stroke is attached to the rest of the character stays put, so nothing
   breaks off. A lasso moves or turns parts of a character, and an eraser removes them.
-- **Nothing is lost.** Every edit (squish, bend, crop, strokes, lengthening, moving, turning, erasing, weight) has an
+- **Draw new strokes with the mouse.** Strokes are even, with ends rounded and a little slimmer just
+  before the tip, like iron-wire seal script (鐵線篆). Their thickness starts at the thickness of the
+  character's own strokes and is shown in mm on the printed seal. With "Guess the shape" on, each
+  stroke is tidied as you let go: nearly straight becomes a straight line (level or upright if it
+  nearly is), part of a circle an arc, a loop a circle or ellipse, anything else a smooth curve, and
+  sharp corners are kept, so an L or a Z comes out as crisp straight lines.
+- **Nothing is lost.** Every edit (squish, bend, crop, strokes, lengthening, moving, turning, drawing, erasing, weight) has an
   Original switch that shows the character without it; switching it back brings the edit back.
 - **Two-tone themes.** Dark, Ink, Lacquer, Paper, Celadon, Blue and white, or your own two colours.
 
@@ -92,8 +98,8 @@ warning, then go to **System Settings → Privacy & Security**, scroll down to S
    do: Scale (keeps its proportions), Squish or Crop. Double-click a character to open its editor:
    squish, bend, strokes (draw along a stroke to select it, drag the selection to stretch or bend it,
    right-click to clear it, Ctrl+Z to undo), lengthen the selected stroke, Lasso to move or turn a part
-   (drag the round handle above the outline; Shift turns in 15° steps), Eraser, and weight. The ▸
-   next to each heading shows what it does.
+   (drag the round handle above the outline; Shift turns in 15° steps), Draw new strokes, Eraser, and
+   weight. The ▸ next to each heading shows what it does.
 5. Click the black-and-white seal to inspect it up close (scroll or + and − to zoom, click to go back).
 6. **Export PDF…**
 
